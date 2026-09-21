@@ -4,10 +4,12 @@ import json
 import logging
 import re
 import secrets
+import hashlib
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta , timezone
 
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
@@ -72,6 +74,7 @@ if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
 GOOGLE_REDIRECT_URI = "http://127.0.0.1:8000/auth/google/callback"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 LILY_EMAIL_FROM = os.getenv("LILY_EMAIL_FROM")
@@ -102,11 +105,22 @@ def get_db_connection():
         port=os.environ.get("DB_PORT"),
     )
 
+db_pool = ThreadedConnectionPool(
+    minconn=1,
+    maxconn=10,
+    dbname=os.environ.get("DB_NAME"),
+    user=os.environ.get("DB_USER"),
+    password=os.environ.get("DB_PASSWORD"),
+    host=os.environ.get("DB_HOST"),
+    port=os.environ.get("DB_PORT"),
+)
+
 
 @contextmanager
 def db_cursor():
-    conn = get_db_connection()
+    conn = db_pool.getconn()
     cur = conn.cursor()
+
     try:
         yield cur
         conn.commit()
@@ -115,13 +129,37 @@ def db_cursor():
         raise
     finally:
         cur.close()
-        conn.close()
+        db_pool.putconn(conn)
 
 
 def create_access_token(user_id: int) -> str:
-    expire = datetime.now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {"user_id": user_id, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def create_refresh_token() -> str:
+    return secrets.token_urlsafe(64)
+
+def hash_refresh_token( token : str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def create_refresh_session(user_id : int) -> str:
+    refresh_token = create_refresh_token()
+    token_hash = hash_refresh_token(refresh_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO refresh_sessions
+            (user_id , token_hash , expires_at)
+            VALUES (%s , %s , %s)
+            """,
+            (user_id , token_hash, expires_at)
+        )
+
+    return refresh_token    
 
 
 def get_current_user(
@@ -333,6 +371,9 @@ class GenerateNoteRequest(BaseModel):
     source_id: int
     topic: str
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str    
+
 
 @app.get("/")
 def read_root():
@@ -382,11 +423,80 @@ def verify_registration_otp(request: Request, data: VerifyRegistrationOTP):
         cur.execute("UPDATE users SET email_verified = TRUE WHERE id = %s;", (user_id,))
 
     access_token = create_access_token(user_id)
+    refresh_token = create_refresh_session(user_id)
     return {
         "message": "Email verified successfully",
         "access_token": access_token,
-        "token_type": "bearer",
+        "refresh_token" : refresh_token,
+        "token_type": "bearer"
     }
+
+@app.post("/refresh")
+@limiter.limit("20/minute")
+def refresh_access_token(
+    request: Request,
+    data: RefreshTokenRequest
+):
+    token_hash = hash_refresh_token(data.refresh_token)
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE refresh_sessions
+            SET revoked_at = NOW(),
+                last_used_at = NOW()
+            WHERE token_hash = %s
+              AND revoked_at IS NULL
+              AND expires_at > NOW()
+            RETURNING id, user_id
+            """,
+            (token_hash,)
+        )
+
+        session = cur.fetchone()
+
+        if not session:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired refresh token"
+            )
+
+        session_id, user_id = session
+
+    new_access_token = create_access_token(user_id)
+    new_refresh_token = create_refresh_session(user_id)
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer"
+    }
+
+@app.post("/logout")
+@limiter.limit("20/minute")
+def logout(
+    request: Request,
+    data: RefreshTokenRequest
+):
+    token_hash = hash_refresh_token(data.refresh_token)
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE refresh_sessions
+            SET revoked_at = NOW(),
+                last_used_at = NOW()
+            WHERE token_hash = %s
+              AND revoked_at IS NULL
+            """,
+            (token_hash,)
+        )
+
+    return {
+        "message": "Logged out successfully"
+    }
+         
+
 
 
 @app.post("/login")
@@ -432,10 +542,12 @@ def verify_login_otp(request: Request, data: VerifyLoginOTP):
     user_id = consume_otp(email, data.otp, "login")
 
     access_token = create_access_token(user_id)
+    refresh_token = create_refresh_session(user_id)
     return {
         "message": "Login successful",
         "access_token": access_token,
-        "token_type": "bearer",
+          "refresh_token": refresh_token,
+        "token_type": "bearer"
     }
 
 
@@ -565,10 +677,12 @@ def google_callback(request: Request):
             )
 
     access_token = create_access_token(user_id)
+    refresh_token = create_refresh_session(user_id)
     return {
         "message": "Google login successful",
         "access_token": access_token,
-        "token_type": "bearer",
+        "refresh_token" : refresh_token,
+        "token_type": "bearer"
     }
 
 
@@ -817,7 +931,22 @@ NOTE_BLOCK_SCHEMA_EXAMPLE = """
     {"type": "numbered_list", "content": ["Step 1", "Step 2"]},
     {"type": "highlight", "content": "Important point"},
     {"type": "example", "content": "Example content"},
-    {"type": "formula", "content": "Formula"}
+    {"type": "formula", "content": "Formula"},
+    {
+      "type": "correction",
+      "content": "The source statement is incorrect. Corrected explanation...",
+      "source_reference": "Page 2",
+      "source_claim": "Original statement from the source",
+      "issue": "Why the statement is incorrect",
+      "corrected_content": "Corrected statement or explanation"
+    },
+    {
+      "type": "verification_note",
+      "content": "This source claim could not be confidently verified.",
+      "source_reference": "Page 3",
+      "claim": "Claim requiring verification",
+      "note": "Reason it could not be confidently verified"
+    }
   ]
 }
 """
@@ -825,9 +954,16 @@ NOTE_BLOCK_SCHEMA_EXAMPLE = """
 
 def build_note_prompt(topic: str, text_style, analysed_style, source_text: str) -> str:
     return f"""
-You are Lily, a personalized study companion.
+You are Lily, a personalized AI study companion.
 
-The user wants study notes about:
+Your task is to transform the provided source material into accurate,
+student-friendly study notes while preserving academic correctness.
+
+You have THREE responsibilities:
+
+1. Understand the source material.
+2. Verify important factual, mathematical, logical, and technical claims.
+3. Generate personalized study notes based on the verified information.
 
 TOPIC:
 {topic}
@@ -841,26 +977,226 @@ ANALYSED STYLE FROM SAMPLE NOTES:
 SOURCE MATERIAL:
 {source_text}
 
-Create study notes about the requested topic using ONLY information
-supported by the source material.
+
+==================================================
+1. SOURCE AND KNOWLEDGE BOUNDARY
+==================================================
+
+The source material is the primary reference for what the notes are about.
+
+Use information from the source whenever it is available.
+
+DO NOT invent:
+- facts
+- definitions
+- formulas
+- equations
+- numerical values
+- examples
+- proofs
+- algorithms
+- conclusions
+- historical claims
+- technical explanations
+- assumptions
+
+Do not add outside information merely to make the notes sound more complete.
+
+However, source material itself may contain mistakes.
+
+Therefore:
+
+SOURCE CONTENT IS NOT AUTOMATICALLY CORRECT.
+
+You must independently verify important claims before presenting them
+as established facts.
+
+
+==================================================
+2. CLAIM VERIFICATION
+==================================================
+
+Before generating the final notes, internally examine important claims
+in the source.
+
+Pay particular attention to:
+
+- mathematical statements
+- equations and formulas
+- numerical calculations
+- definitions
+- theorem statements
+- proofs
+- logical arguments
+- algorithm descriptions
+- examples
+- counterexamples
+- conclusions
+- cause-and-effect claims
+- technical terminology
+
+For mathematical or logical examples, actually test the reasoning.
+
+If the source claims that an example demonstrates a particular property,
+check whether the example actually satisfies the relevant definition.
+
+Do NOT accept an argument merely because it sounds convincing.
+
+
+==================================================
+3. SOURCE ERROR DETECTION
+==================================================
+
+If a source statement is demonstrably incorrect, DO NOT silently reproduce it.
+
+Instead:
+
+1. Identify the incorrect statement.
+2. Explain briefly why it is incorrect.
+3. Provide the corrected statement.
+4. Explain the correction in a student-friendly way.
+5. Mark the generated block as a source correction.
+6. Preserve a reference to the relevant source location when one can
+   genuinely be identified.
 
 IMPORTANT:
-- Follow the user's declared style when it is provided.
-- Use the analysed style to reproduce the user's actual note-taking patterns.
-- Do not invent information that is not present in the source.
-- Do not mention the style profile in the generated notes.
-- Focus specifically on the requested topic.
-- Make the result useful for studying.
 
-Return ONLY valid JSON.
-Do not use Markdown.
-Do not wrap the JSON in ```json or any code fences.
+Never invent a source error.
 
-Use exactly this structure:
+Only mark something as incorrect when the contradiction can be established
+with high confidence.
 
-{NOTE_BLOCK_SCHEMA_EXAMPLE}
+If a statement is unusual but potentially valid, do not correct it merely
+because it differs from your expectations.
 
-Allowed block types:
+
+==================================================
+4. UNCERTAINTY
+==================================================
+
+If you cannot confidently determine whether an important source statement
+is correct, DO NOT guess.
+
+Do not manufacture a correction.
+
+Instead, create a verification_note block explaining that the statement
+could not be reliably verified.
+
+The student must be able to distinguish between:
+
+- verified source information
+- verified corrections
+- claims requiring further verification
+
+
+==================================================
+5. MATHEMATICAL AND TECHNICAL SAFETY
+==================================================
+
+For mathematics, computer science, engineering, physics, statistics,
+machine learning, and other technical subjects:
+
+- preserve mathematical meaning
+- preserve equations correctly
+- preserve variable relationships
+- preserve numerical values unless demonstrably wrong
+- verify examples against the definitions they demonstrate
+- verify conclusions against the preceding reasoning
+- do not change notation merely for stylistic reasons
+- do not simplify expressions in a way that changes their meaning
+
+If a worked example contains an incorrect calculation, correct it only
+after independently checking the calculation.
+
+If a proof contains a logical error, identify the error rather than
+pretending that the proof is valid.
+
+If a theorem or definition is stated incorrectly, clearly distinguish
+the source statement from the corrected version.
+
+
+==================================================
+6. SOURCE REFERENCES
+==================================================
+
+Whenever possible, associate important content with its location in
+the source.
+
+If the source contains page numbers or clearly identifiable sections,
+preserve those references.
+
+DO NOT invent page numbers or source references.
+
+If an exact source location cannot be determined, omit the reference.
+
+
+==================================================
+7. PERSONALIZED NOTE STYLE
+==================================================
+
+The user's declared and analysed writing style should affect ONLY
+presentation.
+
+You may personalize:
+
+- sentence length
+- organization
+- amount of explanation
+- use of bullets
+- use of headings
+- emphasis
+- visual structure
+- concise versus detailed explanations
+
+STYLE MUST NEVER OVERRIDE CORRECTNESS.
+
+Do not intentionally introduce incorrect, incomplete, or ambiguous
+explanations because they resemble the user's notes.
+
+Do not mention the style profile in the generated notes.
+
+
+==================================================
+8. TOPIC RELEVANCE
+==================================================
+
+Focus on:
+
+{topic}
+
+Prefer information directly relevant to the requested topic.
+
+Do not fill the notes with unrelated material merely because it appears
+somewhere in the source.
+
+Include prerequisite information only when it is necessary to understand
+the requested topic.
+
+
+==================================================
+9. TRANSPARENT CORRECTIONS
+==================================================
+
+Never silently replace an incorrect source statement with a corrected one.
+
+When Lily corrects the source, explicitly communicate that a correction
+was made.
+
+The student should be able to understand:
+
+SOURCE CLAIM
+→ VERIFICATION
+→ PROBLEM
+→ CORRECTED CLAIM
+→ EXPLANATION
+
+
+==================================================
+10. OUTPUT BLOCK TYPES
+==================================================
+
+Use only these block types:
+
 heading
 text
 bullet_list
@@ -868,6 +1204,165 @@ numbered_list
 highlight
 example
 formula
+correction
+verification_note
+
+
+==================================================
+11. BLOCK RULES
+==================================================
+
+heading:
+Used for section titles.
+
+text:
+Used for normal explanations.
+
+bullet_list:
+Used for grouped points.
+
+numbered_list:
+Used for ordered procedures, conditions, or steps.
+
+highlight:
+Used for important verified facts or conclusions.
+
+example:
+Used for examples supported by the source or examples necessary to
+explain a verified correction.
+
+formula:
+Used for mathematical or technical expressions.
+
+correction:
+Used ONLY when Lily has identified a demonstrably incorrect source claim
+and verified the correction.
+
+verification_note:
+Used when an important source claim cannot be confidently verified.
+
+
+==================================================
+12. CORRECTION BLOCK
+==================================================
+
+Every correction block must communicate:
+
+- what the source claimed
+- why the claim is incorrect
+- the corrected explanation
+
+Use the correction structure defined in the JSON schema below.
+
+Do not create a correction merely because the source explanation could
+be clearer.
+
+A correction means the original claim is actually wrong.
+
+
+==================================================
+13. VERIFICATION NOTE
+==================================================
+
+Use the verification_note structure defined in the JSON schema below.
+
+Only use it when an important source claim cannot be confidently verified.
+
+Do not use verification_note for ordinary stylistic issues.
+
+
+==================================================
+14. NO HALLUCINATED EXAMPLES
+==================================================
+
+Do not create new worked examples merely to make the notes look better.
+
+If the source already contains an example, preserve its meaning.
+
+If the source example is incorrect and Lily can verify the correction,
+correct it explicitly.
+
+Do not create new mathematical, technical, scientific, or algorithmic
+examples that are not present in the source.
+
+If a source example is incorrect and Lily can verify the correction,
+correct the existing example explicitly.
+
+When explaining a correction, use reasoning and explanation rather than
+inventing a new worked example.
+
+
+==================================================
+15. FINAL INTERNAL AUDIT
+==================================================
+
+Before producing the JSON, internally check every generated block.
+
+Check:
+
+1. Is it relevant to the requested topic?
+2. Is it supported by the source or explicitly marked as a correction?
+3. Is the mathematics correct?
+4. Are formulas preserved correctly?
+5. Are examples actually valid?
+6. Do conclusions follow from the reasoning?
+7. Did personalization change only presentation?
+8. Did Lily accidentally invent information?
+9. Did Lily silently modify a source claim?
+10. If a correction was made, is it explicitly marked?
+11. If something cannot be verified, is it marked as uncertain?
+12. Are source references genuine?
+
+If a block fails these checks, revise or remove it before returning JSON.
+
+
+==================================================
+16. INSUFFICIENT SOURCE INFORMATION
+==================================================
+
+If the source does not contain enough reliable information to generate
+a complete note about the requested topic:
+
+DO NOT fill the missing information using guesses.
+
+Instead, generate a concise verification_note explaining that the source
+does not contain enough reliable information for that part of the topic.
+
+A shorter correct note is better than a longer hallucinated note.
+
+
+==================================================
+17. JSON OUTPUT
+==================================================
+
+Return ONLY valid JSON.
+
+Do NOT use Markdown.
+
+Do NOT wrap the JSON in code fences.
+
+Use exactly this structure:
+
+{NOTE_BLOCK_SCHEMA_EXAMPLE}
+
+Allowed block types:
+
+heading
+text
+bullet_list
+numbered_list
+highlight
+example
+formula
+correction
+verification_note
+
+The JSON must contain no additional top-level fields beyond those defined
+by the schema.
+
+FINAL RULE:
+
+Accuracy is more important than completeness.
 """
 
 
@@ -906,10 +1401,14 @@ def generate_note(request: Request, payload: GenerateNoteRequest, current_user: 
     prompt = build_note_prompt(payload.topic, text_style, analysed_style, source_text)
 
     response = anthropic_client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    model="claude-sonnet-5",
+    max_tokens=8192,
+    thinking={"type": "adaptive"},
+    output_config={"effort": "medium"},
+    messages=[
+        {"role": "user", "content": prompt}
+    ],
+)
 
     response_text = "".join(block.text for block in response.content if block.type == "text")
 
@@ -921,15 +1420,69 @@ def generate_note(request: Request, payload: GenerateNoteRequest, current_user: 
         return {"message": "Claude returned invalid JSON", "raw_response": response_text}
 
     with db_cursor() as cur:
+    # Save the complete Claude response first
         cur.execute(
-            """
-            INSERT INTO notes (user_id, source_id, style_profile_id, generated_content)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id;
-            """,
-            (current_user, source_id, style_profile_id, json.dumps(generated_content)),
+        """
+        INSERT INTO notes (
+            user_id,
+            source_id,
+            style_profile_id,
+            generated_content
         )
+        VALUES (%s, %s, %s, %s)
+        RETURNING id;
+        """,
+        (
+            current_user,
+            source_id,
+            style_profile_id,
+            json.dumps(generated_content),
+        ),
+    )
+
         note_id = cur.fetchone()[0]
+
+    # Normalize generated blocks
+        blocks = generated_content.get("blocks", [])
+
+        for order_index, block in enumerate(blocks):
+            block_type = block.get("type")
+
+            if not block_type:
+              continue
+
+            content = block.get("content")
+
+        # Store additional block-specific information
+            metadata = {
+            key: value
+            for key, value in block.items()
+            if key not in {"type", "content", "source_reference"}
+        }
+
+            source_reference = block.get("source_reference")
+
+            cur.execute(
+            """
+            INSERT INTO note_blocks (
+                note_id,
+                block_type,
+                content,
+                source_reference,
+                metadata,
+                order_index
+            )
+            VALUES (%s, %s, %s, %s, %s, %s);
+            """,
+            (
+                note_id,
+                block_type,
+                json.dumps(content),
+                source_reference,
+                json.dumps(metadata) if metadata else None,
+                order_index,
+            ),
+        )
 
     return {
         "message": "Note generated successfully",
