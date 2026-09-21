@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <div class="start-gate"></div>
+
+    <audio id="dropSound" src="drop.mp3" preload="auto"></audio>
+    <audio id="bloomSound" src="bloom.mp3" preload="auto"></audio>
+
+    <div class="scene">
+        <div class="companion-text">I'm Lily, your companion.</div>
+        <svg class="droplet" viewBox="0 0 100 100">
+            <defs>
+                <radialGradient id="waterGrad" cx="35%" cy="25%" r="75%">
+                    <stop offset="0%" stop-color="rgba(255,255,255,0.95)"/>
+                    <stop offset="35%" stop-color="rgba(180,220,255,0.75)"/>
+                    <stop offset="100%" stop-color="rgba(60,120,190,0.35)"/>
+                </radialGradient>
+            </defs>
+            <path d="
+                M 50,10
+                C 45,25 35,40 35,55
+                C 35,75 42,90 50,90
+                C 58,90 65,75 65,55
+                C 65,40 55,25 50,10
+                Z
+            " fill="aqua"/>
+        </svg>
+
+        <svg class="ripple ripple-1" viewBox="0 0 100 100">
+            <ellipse cx="50" cy="50" rx="20" ry="10" fill="none" stroke="rgba(200,230,255,0.8)" stroke-width="1.5"/>
+        </svg>
+        <svg class="ripple ripple-2" viewBox="0 0 100 100">
+            <ellipse cx="50" cy="50" rx="20" ry="10" fill="none" stroke="rgba(200,230,255,0.5)" stroke-width="1"/>
+        </svg>
+        <svg class="ripple ripple-3" viewBox="0 0 100 100">
+            <ellipse cx="50" cy="50" rx="20" ry="10" fill="none" stroke="rgba(200,230,255,0.3)" stroke-width="0.75"/>
+        </svg>
+
+        <svg class="flower" viewBox="0 0 100 100">
+            <defs>
+                <linearGradient id="petalOuter" x1="0%" y1="100%" x2="0%" y2="0%">
+                    <stop offset="0%" stop-color="#ff8fc7"/>
+                    <stop offset="100%" stop-color="#fff0f7"/>
+                </linearGradient>
+                <linearGradient id="petalInner" x1="0%" y1="100%" x2="0%" y2="0%">
+                    <stop offset="0%" stop-color="#ffd4ea"/>
+                    <stop offset="100%" stop-color="#ffffff"/>
+                </linearGradient>
+            </defs>
+
+            <g class="flower-group">
+                <g class="petal-layer-outer">
+                    <path class="petal-outer" d="M 50,50 C 42,32 38,10 50,2 C 62,10 58,32 50,50 Z" fill="url(#petalOuter)" transform="rotate(0 50 50)"/>
+                    <path class="petal-outer" d="M 50,50 C 42,32 38,10 50,2 C 62,10 58,32 50,50 Z" fill="url(#petalOuter)" transform="rotate(60 50 50)"/>
+                    <path class="petal-outer" d="M 50,50 C 42,32 38,10 50,2 C 62,10 58,32 50,50 Z" fill="url(#petalOuter)" transform="rotate(120 50 50)"/>
+                    <path class="petal-outer" d="M 50,50 C 42,32 38,10 50,2 C 62,10 58,32 50,50 Z" fill="url(#petalOuter)" transform="rotate(180 50 50)"/>
+                    <path class="petal-outer" d="M 50,50 C 42,32 38,10 50,2 C 62,10 58,32 50,50 Z" fill="url(#petalOuter)" transform="rotate(240 50 50)"/>
+                    <path class="petal-outer" d="M 50,50 C 42,32 38,10 50,2 C 62,10 58,32 50,50 Z" fill="url(#petalOuter)" transform="rotate(300 50 50)"/>
+                </g>
+
+                <g class="petal-layer-inner">
+                    <path class="petal-inner" d="M 50,50 C 45,36 43,20 50,10 C 57,20 55,36 50,50 Z" fill="url(#petalInner)" transform="rotate(30 50 50)"/>
+                    <path class="petal-inner" d="M 50,50 C 45,36 43,20 50,10 C 57,20 55,36 50,50 Z" fill="url(#petalInner)" transform="rotate(90 50 50)"/>
+                    <path class="petal-inner" d="M 50,50 C 45,36 43,20 50,10 C 57,20 55,36 50,50 Z" fill="url(#petalInner)" transform="rotate(150 50 50)"/>
+                    <path class="petal-inner" d="M 50,50 C 45,36 43,20 50,10 C 57,20 55,36 50,50 Z" fill="url(#petalInner)" transform="rotate(210 50 50)"/>
+                    <path class="petal-inner" d="M 50,50 C 45,36 43,20 50,10 C 57,20 55,36 50,50 Z" fill="url(#petalInner)" transform="rotate(270 50 50)"/>
+                    <path class="petal-inner" d="M 50,50 C 45,36 43,20 50,10 C 57,20 55,36 50,50 Z" fill="url(#petalInner)" transform="rotate(330 50 50)"/>
+                </g>
+
+                <g class="stamens">
+                    <line x1="50" y1="50" x2="46" y2="40" stroke="#e0a800" stroke-width="0.8"/>
+                    <line x1="50" y1="50" x2="54" y2="40" stroke="#e0a800" stroke-width="0.8"/>
+                    <line x1="50" y1="50" x2="50" y2="38" stroke="#e0a800" stroke-width="0.8"/>
+                    <circle cx="46" cy="40" r="1.5" fill="#ffcb3d"/>
+                    <circle cx="54" cy="40" r="1.5" fill="#ffcb3d"/>
+                    <circle cx="50" cy="38" r="1.5" fill="#ffcb3d"/>
+                </g>
+
+                <circle class="flower-center" cx="50" cy="50" r="4" fill="#ffd93d"/>
+            </g>
+        </svg>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

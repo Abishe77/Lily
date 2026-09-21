@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+psycopg2-binary
+python-dotenv
+passlib[bcrypt]
+anthropic
+pypdf
+python-jose
+google-auth
+google-auth-oauthlib
+python-multipart

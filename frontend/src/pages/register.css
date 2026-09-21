@@ -1,0 +1,148 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;1,400;1,500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600&display=swap');
+
+html,
+body,
+#root {
+    height: 100%;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+:root {
+    --bg: #F7F4EF;
+    --panel-from: #EDE7DF;
+    --panel-mid: #E6DFEE;
+    --panel-to: #D9EAE8;
+    --white: #FDFBF8;
+    --charcoal: #27231F;
+    --ink: #3D3830;
+    --mid: #7A7168;
+    --muted: #A8A099;
+    --faint: #C8C1B8;
+    --rose: #C4978A;
+    --lavender: #A99EC0;
+    --aqua: #7FB3B1;
+    --border: #DDD7CE;
+    --border-soft: #E8E3DB;
+    --focus-ring: rgba(169, 158, 192, 0.22);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Manrope', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--charcoal);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+::placeholder {
+    color: var(--faint);
+    opacity: 1;
+}
+
+::-webkit-scrollbar {
+    display: none;
+}
+
+* {
+    scrollbar-width: none;
+}
+
+/* Fields */
+
+.lily-field {
+    width: 100%;
+    padding: 13px 16px;
+    font-family: 'Manrope', system-ui, sans-serif;
+    font-size: 14px;
+    font-weight: 400;
+    color: var(--ink);
+    background: var(--white);
+    border: 1.5px solid var(--border-soft);
+    border-radius: 12px;
+    outline: none;
+    transition:
+        border-color 0.22s ease,
+        box-shadow 0.22s ease,
+        background 0.18s ease;
+    letter-spacing: 0.01em;
+}
+
+.lily-field:focus {
+    border-color: var(--lavender);
+    box-shadow: 0 0 0 4px var(--focus-ring);
+    background: #FEFCFA;
+}
+
+.lily-field:hover:not(:focus) {
+    border-color: var(--faint);
+}
+
+/* Buttons */
+
+.btn-primary {
+    width: 100%;
+    padding: 14.5px 24px;
+    background: var(--charcoal);
+    color: var(--white);
+    border: none;
+    border-radius: 12px;
+    font-family: 'Manrope', system-ui, sans-serif;
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition:
+        opacity 0.2s ease,
+        transform 0.15s ease,
+        box-shadow 0.2s ease;
+}
+
+.btn-primary:hover {
+    opacity: 0.84;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(39, 35, 31, 0.18);
+}
+
+.btn-primary:active {
+    transform: translateY(0);
+    opacity: 0.9;
+}
+
+.btn-google {
+    width: 100%;
+    padding: 13.5px 24px;
+    background: var(--white);
+    color: var(--ink);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    font-family: 'Manrope', system-ui, sans-serif;
+    font-size: 14px;
+    font-weight: 400;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    transition:
+        background 0.18s ease,
+        border-color 0.18s ease,
+        transform 0.15s ease;
+}
+
+.btn-google:hover {
+    background: #F3EFE9;
+    border-color: var(--faint);
+    transform: translateY(-1px);
+}
+
+.btn-google:active {
+    transform: translateY(0);
+}

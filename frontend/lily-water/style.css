@@ -1,0 +1,72 @@
+body {
+    margin: 0;
+    background: black;
+    overflow: hidden;
+}
+
+.start-gate {
+    position: fixed;
+    inset: 0;
+    background: black;
+    z-index: 999;
+    cursor: pointer;
+}
+
+.scene {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+}
+
+.droplet {
+    width: 50px;
+    height: 50px;
+    position: absolute;
+    left: 50%;
+    top: 15%;
+    transform: translateX(-50%);
+    filter: drop-shadow(0 0 4px rgba(150,200,255,0.5));
+}
+
+.ripple {
+    width: 120px;
+    height: 50px;
+    position: absolute;
+    left: 50%;
+    top: 78%;
+    transform: translate(-50%, -50%);
+}
+
+.flower {
+    width: 160px;
+    height: 160px;
+    position: absolute;
+    left: 50%;
+    top: 78%;
+}
+
+.flower-group {
+    transform-origin: 50% 50%;
+}
+
+.petal-outer, .petal-inner {
+    transform-origin: 50px 50px;
+}
+
+.companion-text {
+    position: absolute;
+    top: 50%;
+    color: #de91d5;
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 500;
+    font-size: 34px;
+    letter-spacing: 0.2px;
+    white-space: nowrap;
+    visibility: hidden;
+}
+
+.companion-text .letter {
+    display: inline-block;
+    opacity: 0;
+}
+
