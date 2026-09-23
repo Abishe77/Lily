@@ -179,8 +179,11 @@ CREATE INDEX idx_refresh_sessions_expires_at
     ON refresh_sessions(expires_at);
 
 
+CREATE EXTENSION vector;
 
-
+SELECT extname, extversion
+FROM pg_extension
+WHERE extname = 'vector';
 
 
 
