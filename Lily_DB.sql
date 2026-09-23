@@ -1,4 +1,16 @@
+CREATE TYPE topic_status AS ENUM (
+    'urgent',
+    'monitor',
+    'resolved'
+);
 
+CREATE TYPE personality_mode AS ENUM (
+    'funny_sarcastic',
+    'friendly_encouraging',
+    'strict_disciplined',
+    'professional',
+    'calm_gentle'
+);
 
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
@@ -48,6 +60,7 @@ CREATE TABLE companions (
     user_id INT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name VARCHAR(20) NOT NULL,
     gender VARCHAR(20) NOT NULL,
+    personality_mode personality_mode NOT NULL DEFAULT 'funny_sarcastic',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -80,8 +93,10 @@ CREATE TABLE notes (
 CREATE TABLE note_blocks (
     id SERIAL PRIMARY KEY,
     note_id INT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-    content TEXT NOT NULL,
-    source_page INT NOT NULL,
+    block_type VARCHAR(30) NOT NULL,
+    content JSONB NOT NULL,
+    source_reference TEXT,
+    metadata JSONB,
     order_index INT NOT NULL
 );
 
@@ -99,12 +114,6 @@ CREATE TABLE quiz_attempts (
     score INT NOT NULL,
     time_taken_seconds DECIMAL,
     attempted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TYPE topic_status AS ENUM (
-    'urgent',
-    'monitor',
-    'resolved'
 );
 
 CREATE TABLE weak_topics (
@@ -127,6 +136,12 @@ CREATE TABLE refresh_sessions (
     last_used_at TIMESTAMPTZ
 );
 
+CREATE INDEX idx_auth_accounts_user_id
+    ON auth_accounts(user_id);
+
+CREATE INDEX idx_otp_codes_user_id
+    ON otp_codes(user_id);
+
 CREATE INDEX idx_sources_user_id
     ON sources(user_id);
 
@@ -139,8 +154,14 @@ CREATE INDEX idx_notes_source_id
 CREATE INDEX idx_note_blocks_note_id
     ON note_blocks(note_id);
 
+CREATE INDEX idx_note_blocks_type
+    ON note_blocks(block_type);
+
 CREATE INDEX idx_quizzes_note_id
     ON quizzes(note_id);
+
+CREATE INDEX idx_quiz_attempts_quiz_id
+    ON quiz_attempts(quiz_id);
 
 CREATE INDEX idx_quiz_attempts_user_id
     ON quiz_attempts(user_id);
@@ -148,11 +169,18 @@ CREATE INDEX idx_quiz_attempts_user_id
 CREATE INDEX idx_weak_topics_user_id
     ON weak_topics(user_id);
 
+CREATE INDEX idx_weak_topics_note_block_id
+    ON weak_topics(note_block_id);
+
 CREATE INDEX idx_refresh_sessions_user_id
     ON refresh_sessions(user_id);
 
 CREATE INDEX idx_refresh_sessions_expires_at
     ON refresh_sessions(expires_at);
+
+
+
+
 
 
 

@@ -5,6 +5,8 @@ import logging
 import re
 import secrets
 import hashlib
+import hmac
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timedelta , timezone
 
@@ -21,8 +23,11 @@ from google.oauth2 import id_token
 from google_auth_oauthlib.flow import Flow
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel
+from pydantic import BaseModel , Field , ValidationError , ConfigDict
+from typing import Any , Literal
 from pypdf import PdfReader
+from docx import Document
+from pptx import Presentation
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -133,9 +138,40 @@ def db_cursor():
 
 
 def create_access_token(user_id: int) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"user_id": user_id, "exp": expire}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT auth_version
+            FROM users
+            WHERE id = %s;
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User account not found"
+        )
+
+    auth_version = row[0]
+
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
+    payload = {
+        "user_id": user_id,
+        "auth_version": auth_version,
+        "exp": expire,
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
 
 def create_refresh_token() -> str:
     return secrets.token_urlsafe(64)
@@ -165,15 +201,57 @@ def create_refresh_session(user_id : int) -> str:
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> int:
+
     token = credentials.credentials
+
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM]
+        )
+
         user_id = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid authentication token")
+        token_auth_version = payload.get("auth_version")
+
+        if user_id is None or token_auth_version is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication token"
+            )
+
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT auth_version
+                FROM users
+                WHERE id = %s;
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=401,
+                detail="User account not found"
+            )
+
+        current_auth_version = row[0]
+
+        if token_auth_version != current_auth_version:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication session is no longer valid"
+            )
+
         return user_id
+
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired authentication token"
+        )
 
 
 def validate_password(password: str):
@@ -192,6 +270,13 @@ def validate_password(password: str):
 
 def generate_otp() -> str:
     return str(secrets.randbelow(900000) + 100000)
+
+def hash_otp(otp : str) -> str:
+    return hmac.new(
+        SECRET_KEY.encode(),
+        otp.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
 
 def validate_email_format(email: str):
@@ -245,6 +330,7 @@ def clear_login_attempts(email: str):
 
 def store_otp(email: str, user_id: int, purpose: str) -> str:
     otp = generate_otp()
+    otp_hash = hash_otp(otp)
 
     with db_cursor() as cur:
         cur.execute(
@@ -266,16 +352,16 @@ def store_otp(email: str, user_id: int, purpose: str) -> str:
 
         cur.execute(
             """
-            INSERT INTO otp_codes (user_id, email, purpose, otp, attempts, created_at, expires_at)
+            INSERT INTO otp_codes (user_id, email, purpose, otp_hash, attempts, created_at, expires_at)
             VALUES (%s, %s, %s, %s, 0, NOW(), NOW() + (%s * INTERVAL '1 minute'))
             ON CONFLICT (email, purpose) DO UPDATE SET
                 user_id = EXCLUDED.user_id,
-                otp = EXCLUDED.otp,
+                otp_hash = EXCLUDED.otp_hash,
                 attempts = 0,
                 created_at = NOW(),
                 expires_at = EXCLUDED.expires_at;
             """,
-            (user_id, email, purpose, otp, OTP_EXPIRE_MINUTES),
+            (user_id, email, purpose, otp_hash, OTP_EXPIRE_MINUTES),
         )
 
     return otp
@@ -285,7 +371,7 @@ def consume_otp(email: str, data_otp: str, purpose: str) -> int:
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT id, user_id, otp, attempts, NOW() > expires_at
+            SELECT id, user_id, otp_hash, attempts, NOW() > expires_at
             FROM otp_codes
             WHERE email = %s AND purpose = %s;
             """,
@@ -296,7 +382,7 @@ def consume_otp(email: str, data_otp: str, purpose: str) -> int:
         if row is None:
             raise HTTPException(status_code=404, detail="OTP not found")
 
-        otp_id, user_id, stored_otp, attempts, expired = row
+        otp_id, user_id, stored_otp_hash, attempts, expired = row
 
         if expired:
             cur.execute("DELETE FROM otp_codes WHERE id = %s;", (otp_id,))
@@ -306,8 +392,12 @@ def consume_otp(email: str, data_otp: str, purpose: str) -> int:
             cur.execute("DELETE FROM otp_codes WHERE id = %s;", (otp_id,))
             raise HTTPException(status_code=429, detail="Too many invalid attempts")
 
-        if data_otp != stored_otp:
-            cur.execute("UPDATE otp_codes SET attempts = attempts + 1 WHERE id = %s;", (otp_id,))
+        data_otp_hash = hash_otp(data_otp)
+
+        if not hmac.compare_digest(data_otp_hash, stored_otp_hash):
+            cur.execute(
+                "UPDATE otp_codes SET attempts = attempts + 1 WHERE id = %s;",
+                  (otp_id,))
             raise HTTPException(status_code=400, detail="Invalid OTP")
 
         cur.execute("DELETE FROM otp_codes WHERE id = %s;", (otp_id,))
@@ -335,6 +425,27 @@ def send_otp_email(email: str, otp: str):
             detail="Failed to send verification email"
         )
 
+def send_password_reset_email(email: str, otp: str):
+    try:
+        resend.Emails.send({
+            "from": LILY_EMAIL_FROM,
+            "to": [email],
+            "subject": "Reset your Lily password",
+            "html": f"""
+                <h2>Reset your Lily password</h2>
+                <p>Your password reset code is:</p>
+                <h1>{otp}</h1>
+                <p>This code expires in 5 minutes.</p>
+                <p>If you did not request a password reset, you can ignore this email.</p>
+            """
+        })
+    except Exception:
+        logger.exception("Failed to send password reset email")
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to send password reset email"
+        )    
+
 
 class UserRegister(BaseModel):
     name: str
@@ -356,10 +467,19 @@ class VerifyLoginOTP(BaseModel):
     email: str
     otp: str
 
+class ForgotPasswordRequest(BaseModel):
+    email : str
+
+class ResetPasswordRequest(BaseModel):  
+    email : str
+    otp : str
+    new_password : str      
+
 
 class UserCompanion(BaseModel):
     name: str
     gender: str
+    personality_mode : str = "funny_sarcastic"
 
 
 class UserStyleProfile(BaseModel):
@@ -372,7 +492,31 @@ class GenerateNoteRequest(BaseModel):
     topic: str
 
 class RefreshTokenRequest(BaseModel):
-    refresh_token: str    
+    refresh_token: str 
+
+class NoteBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal[
+        "heading",
+        "text",
+        "bullet_list",
+        "numbered_list",
+        "highlight",
+        "example",
+        "formula",
+        "correction",
+        "verification_note",
+    ]
+    content: object
+    source_reference: str | None = None
+
+
+class GeneratedNote(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    title: str
+    blocks: list[NoteBlock]     
 
 
 @app.get("/")
@@ -550,6 +694,90 @@ def verify_login_otp(request: Request, data: VerifyLoginOTP):
         "token_type": "bearer"
     }
 
+@app.post("/forgot-password")
+@limiter.limit("5/minute")
+def forgot_password(
+    request: Request,
+    data: ForgotPasswordRequest
+):
+    email = data.email.strip().lower()
+    validate_email_format(email)
+
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT id FROM users WHERE email = %s;",
+            (email,)
+        )
+        user = cur.fetchone()
+
+    if user is not None:
+        user_id = user[0]
+
+        otp = store_otp(
+            email,
+            user_id,
+            "password_reset"
+        )
+
+        send_password_reset_email(email, otp)
+
+    return {
+        "message": "If an account exists for this email, a password reset code has been sent."
+    }
+
+@app.post("/reset-password")
+@limiter.limit("10/minute")
+def reset_password(
+    request: Request,
+    data: ResetPasswordRequest
+):
+    email = data.email.strip().lower()
+    validate_email_format(email)
+
+    valid, error_message = validate_password(data.new_password)
+
+    if not valid:
+        raise HTTPException(
+            status_code=400,
+            detail=error_message
+        )
+
+    user_id = consume_otp(
+        email,
+        data.otp,
+        "password_reset"
+    )
+
+    hashed_password = pwd_context.hash(data.new_password)
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+            SET hashed_pass = %s,
+            auth_version = auth_version + 1
+            WHERE id = %s;
+            """,
+            (hashed_password, user_id)
+        )
+
+        cur.execute(
+            """
+            UPDATE refresh_sessions
+            SET revoked_at = NOW(),
+                last_used_at = NOW()
+            WHERE user_id = %s
+              AND revoked_at IS NULL;
+            """,
+            (user_id,)
+        )
+
+    clear_login_attempts(email)
+
+    return {
+        "message": "Password reset successfully"
+    }
+
 
 def build_google_flow() -> Flow:
     flow = Flow.from_client_config(
@@ -639,6 +867,8 @@ def google_callback(request: Request):
     google_email = google_user["email"]
     google_name = google_user.get("name")
 
+    if google_user.get("email_verified") is not True: raise HTTPException( status_code=403, detail="Google account email is not verified" )
+
     with db_cursor() as cur:
         cur.execute(
             "SELECT user_id FROM auth_accounts WHERE provider = %s AND provider_user_id = %s",
@@ -691,14 +921,15 @@ def create_companion(user: UserCompanion, current_user: int = Depends(get_curren
     with db_cursor() as cur:
       cur.execute(
     """
-    INSERT INTO companions (user_id, name, gender)
-    VALUES (%s, %s, %s)
+    INSERT INTO companions (user_id, name, gender, personality_mode)
+    VALUES (%s, %s, %s , %s)
     ON CONFLICT (user_id)
     DO UPDATE SET
         name = EXCLUDED.name,
-        gender = EXCLUDED.gender;
+        gender = EXCLUDED.gender,
+        personality_mode = EXCLUDED.personality_mode;
     """,
-    (current_user, user.name, user.gender)
+    (current_user, user.name, user.gender,user.personality_mode)
 )
     return {"message": "Companion saved successfully"}
 
@@ -856,13 +1087,138 @@ def extract_text_from_scanned_pdf(pdf_bytes: bytes) -> str:
     document.close()
     return extracted_text.strip()
 
+def extract_pdf_source(pdf_bytes: bytes):
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+
+    page_texts = []
+
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        page_texts.append(text.strip())
+
+    combined_text = "\n\n".join(
+        text for text in page_texts if text
+    ).strip()
+
+    if combined_text:
+        return {
+            "text": combined_text,
+            "pages": len(reader.pages),
+            "extraction_method": "pypdf"
+        }
+
+    scanned_text = extract_text_from_scanned_pdf(pdf_bytes)
+
+    return {
+        "text": scanned_text,
+        "pages": len(reader.pages),
+        "extraction_method": "claude_vision"
+    }
+
+def extract_docx_source(file_bytes : bytes):
+    document = Document(io.BytesIO(file_bytes))
+
+    paragraphs = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+
+        if text:
+            paragraphs.append(text)
+
+    extracted_text = "\n\n".join(paragraphs)
+
+    return{
+        "text" : extracted_text,
+        "pages" : None,
+        "extraction_method" : "python_docx"
+    } 
+
+def extract_pptx_source(file_bytes: bytes):
+    presentation = Presentation(io.BytesIO(file_bytes))
+
+    slides_text = []
+
+    for slide_number, slide in enumerate(presentation.slides, start=1):
+        slide_parts = []
+
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                text = shape.text.strip()
+
+                if text:
+                    slide_parts.append(text)
+
+        if slide_parts:
+            slide_text = "\n\n".join(slide_parts)
+            slides_text.append(
+                f"--- SLIDE {slide_number} ---\n{slide_text}"
+            )
+
+    extracted_text = "\n\n".join(slides_text)
+
+    return {
+        "text": extracted_text,
+        "pages": len(presentation.slides),
+        "extraction_method": "python_pptx"
+    }
+
+def extract_text_source(file_bytes: bytes):
+    extracted_text = file_bytes.decode("utf-8")
+
+    return {
+        "text": extracted_text,
+        "pages": None,
+        "extraction_method": "utf8"
+    }
+
+def extract_image_source(file_bytes: bytes, media_type: str):
+    image_base64 = base64.b64encode(file_bytes).decode("utf-8")
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_base64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": SCANNED_PAGE_TRANSCRIPTION_PROMPT,
+                    },
+                ],
+            }
+        ],
+    )
+
+    extracted_text = "".join(
+        block.text
+        for block in response.content
+        if block.type == "text"
+    ).strip()
+
+    return {
+        "text": extracted_text,
+        "pages": None,
+        "extraction_method": "claude_vision"
+    }
+
+
 
 @app.post("/upload-source")
 @limiter.limit(CLAUDE_ENDPOINT_RATE_LIMIT)
-async def upload_source(request: Request, file: UploadFile = File(...), current_user: int = Depends(get_current_user)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=415, detail="Only PDF files are accepted")
-
+async def upload_source(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: int = Depends(get_current_user)
+):
     pdf_bytes = await file.read()
 
     if len(pdf_bytes) > MAX_UPLOAD_BYTES:
@@ -871,43 +1227,52 @@ async def upload_source(request: Request, file: UploadFile = File(...), current_
             detail=f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
         )
 
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-    except Exception:
-        raise HTTPException(status_code=400, detail="File is not a valid PDF")
+    filename = file.filename.lower()
 
-    extracted_text = ""
-    for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text()
-        if page_text:
-            extracted_text += f"\n--- PAGE {page_number} ---\n{page_text}"
+    if filename.endswith(".pdf"):
+        result = extract_pdf_source(pdf_bytes)
+ 
+    elif filename.endswith(".docx"):
+       result = extract_docx_source(pdf_bytes)
 
-    extracted_text = extracted_text.strip()
-    extraction_method = "pypdf"
+    elif filename.endswith(".pptx"):
+      result = extract_pptx_source(pdf_bytes)
+
+    elif filename.endswith(".txt") or filename.endswith(".md"):
+        result = extract_text_source(pdf_bytes) 
+
+    elif filename.endswith((".jpeg" , ".jpg", ".png" ,".webp")):
+        result = extract_image_source(pdf_bytes,
+             file.content_type)     
+    else:
+      raise HTTPException(
+        status_code=400,
+        detail="Unsupported file format"
+    )
+
+    extracted_text = result["text"]
 
     if not extracted_text:
-        extraction_method = "claude_vision"
-        extracted_text = extract_text_from_scanned_pdf(pdf_bytes)
-
-    if not extracted_text:
-
-
         return {
             "message": "Could not extract any text from this PDF",
             "filename": file.filename,
-            "pages": len(reader.pages),
+            "pages": result["pages"],
             "characters_extracted": 0,
+            "extraction_method": result["extraction_method"],
         }
 
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO sources (user_id, filename, extracted_text)
-            VALUES (%s, %s, %s)
+            INSERT INTO sources (user_id, filename, extracted_text ,
+            characters_extracted, extraction_type)
+            VALUES (%s, %s, %s, %s, %s)
             RETURNING id;
             """,
-            (current_user, file.filename, extracted_text),
+            (current_user, file.filename, extracted_text,
+             len(extracted_text), result["extraction_method"]),
         )
+
         source_id = cur.fetchone()[0]
 
     return {
@@ -915,10 +1280,11 @@ async def upload_source(request: Request, file: UploadFile = File(...), current_
         "source_id": source_id,
         "user_id": current_user,
         "filename": file.filename,
-        "pages": len(reader.pages),
+        "pages": result["pages"],
         "characters_extracted": len(extracted_text),
-        "extraction_method": extraction_method,
+        "extraction_method": result["extraction_method"],
     }
+
 
 
 NOTE_BLOCK_SCHEMA_EXAMPLE = """
@@ -1368,7 +1734,11 @@ Accuracy is more important than completeness.
 
 @app.post("/generate-note")
 @limiter.limit(CLAUDE_ENDPOINT_RATE_LIMIT)
-def generate_note(request: Request, payload: GenerateNoteRequest, current_user: int = Depends(get_current_user)):
+def generate_note(
+    request: Request,
+    payload: GenerateNoteRequest,
+    current_user: int = Depends(get_current_user)
+):
     with db_cursor() as cur:
         cur.execute(
             """
@@ -1380,109 +1750,153 @@ def generate_note(request: Request, payload: GenerateNoteRequest, current_user: 
             """,
             (current_user,),
         )
+
         style_result = cur.fetchone()
 
         if style_result is None:
-            raise HTTPException(status_code=404, detail="No style profile found for this user")
+            raise HTTPException(
+                status_code=404,
+                detail="No style profile found for this user"
+            )
 
         style_profile_id, text_style, analysed_style = style_result
 
         cur.execute(
-            "SELECT id, extracted_text FROM sources WHERE id = %s AND user_id = %s;",
+            """
+            SELECT id, extracted_text
+            FROM sources
+            WHERE id = %s AND user_id = %s;
+            """,
             (payload.source_id, current_user),
         )
+
         source_result = cur.fetchone()
 
         if source_result is None:
-            raise HTTPException(status_code=404, detail="Source not found for this user")
+            raise HTTPException(
+                status_code=404,
+                detail="Source not found for this user"
+            )
 
         source_id, source_text = source_result
 
-    prompt = build_note_prompt(payload.topic, text_style, analysed_style, source_text)
+    prompt = build_note_prompt(
+        payload.topic,
+        text_style,
+        analysed_style,
+        source_text
+    )
 
-    response = anthropic_client.messages.create(
-    model="claude-sonnet-5",
-    max_tokens=8192,
-    thinking={"type": "adaptive"},
-    output_config={"effort": "medium"},
-    messages=[
-        {"role": "user", "content": prompt}
-    ],
-)
+    try:
+        response = anthropic_client.messages.create(
+            model = "claude-sonnet-5",
+            max_tokens= 8192,
+            thinking={"type" :"adaptive"},
+            output_config={"effort" : "medium"},
+            messages = [
+                {
+                    "role" : "user",
+                    "content" : prompt
+                }
+            ],
+        )
+    except Exception:
+        logger.exception("Claude API request failed")
+        raise HTTPException(
+            status_code = 502,
+            detail= "AI service temporarily unavailable"
+        )    
 
-    response_text = "".join(block.text for block in response.content if block.type == "text")
+    response_text = "".join(
+        block.text
+        for block in response.content
+        if block.type == "text"
+    )
 
     try:
         generated_content = json.loads(response_text)
-    except json.JSONDecodeError:
-
-
-        return {"message": "Claude returned invalid JSON", "raw_response": response_text}
-
-    with db_cursor() as cur:
-    # Save the complete Claude response first
-        cur.execute(
-        """
-        INSERT INTO notes (
-            user_id,
-            source_id,
-            style_profile_id,
+        validated_note = GeneratedNote.model_validate(
             generated_content
         )
-        VALUES (%s, %s, %s, %s)
-        RETURNING id;
-        """,
-        (
-            current_user,
-            source_id,
-            style_profile_id,
-            json.dumps(generated_content),
-        ),
-    )
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail="Claude returned invalid JSON"
+        )
+
+    except ValidationError:
+        logger.exception(
+            "Claude returned invalid note structure"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Claude returned an invalid note structure"
+        )
+
+    generated_content = validated_note.model_dump()
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO notes (
+                user_id,
+                source_id,
+                style_profile_id,
+                generated_content
+            )
+            VALUES (%s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                current_user,
+                source_id,
+                style_profile_id,
+                json.dumps(generated_content),
+            ),
+        )
 
         note_id = cur.fetchone()[0]
 
-    # Normalize generated blocks
-        blocks = generated_content.get("blocks", [])
+        blocks = generated_content["blocks"]
 
         for order_index, block in enumerate(blocks):
-            block_type = block.get("type")
+            block_type = block["type"]
+            content = block["content"]
 
-            if not block_type:
-              continue
-
-            content = block.get("content")
-
-        # Store additional block-specific information
             metadata = {
-            key: value
-            for key, value in block.items()
-            if key not in {"type", "content", "source_reference"}
-        }
+                key: value
+                for key, value in block.items()
+                if key not in {
+                    "type",
+                    "content",
+                    "source_reference"
+                }
+            }
 
             source_reference = block.get("source_reference")
 
             cur.execute(
-            """
-            INSERT INTO note_blocks (
-                note_id,
-                block_type,
-                content,
-                source_reference,
-                metadata,
-                order_index
+                """
+                INSERT INTO note_blocks (
+                    note_id,
+                    block_type,
+                    content,
+                    source_reference,
+                    metadata,
+                    order_index
+                )
+                VALUES (%s, %s, %s, %s, %s, %s);
+                """,
+                (
+                    note_id,
+                    block_type,
+                    json.dumps(content),
+                    source_reference,
+                    json.dumps(metadata) if metadata else None,
+                    order_index,
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s);
-            """,
-            (
-                note_id,
-                block_type,
-                json.dumps(content),
-                source_reference,
-                json.dumps(metadata) if metadata else None,
-                order_index,
-            ),
-        )
 
     return {
         "message": "Note generated successfully",
