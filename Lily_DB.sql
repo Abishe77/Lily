@@ -178,13 +178,27 @@ CREATE INDEX idx_refresh_sessions_user_id
 CREATE INDEX idx_refresh_sessions_expires_at
     ON refresh_sessions(expires_at);
 
+CREATE TABLE teaching_profiles (
+    id SERIAL PRIMARY KEY,
 
-CREATE EXTENSION vector;
+    user_id INT UNIQUE NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
 
-SELECT extname, extversion
-FROM pg_extension
-WHERE extname = 'vector';
+    preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
 
+    evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    confidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    user_override JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_teaching_profiles_user_id
+    ON teaching_profiles(user_id);
 
 
 

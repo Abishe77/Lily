@@ -444,7 +444,7 @@ def send_password_reset_email(email: str, otp: str):
         raise HTTPException(
             status_code=502,
             detail="Failed to send password reset email"
-        )    
+        )
 
 
 class UserRegister(BaseModel):
@@ -485,6 +485,9 @@ class UserCompanion(BaseModel):
 class UserStyleProfile(BaseModel):
     text: str | None = None
     image_base64: str | None = None
+
+class TeachingProfileUpdate(BaseModel):
+    preferences : dict[str , Any] = {}    
 
 
 class GenerateNoteRequest(BaseModel):
@@ -547,6 +550,13 @@ def register_user(request: Request, user: UserRegister):
                 (user.name.strip(), email, hashed_password),
             )
             user_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO teaching_profiles (user_id)
+                VALUES (%s);
+                """,
+                (user_id,),
+            )
     except psycopg2.errors.UniqueViolation:
         return {"message": "Email already registered"}
 
@@ -897,6 +907,13 @@ def google_callback(request: Request):
                     (google_name, google_email),
                 )
                 user_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO teaching_profiles (user_id)
+                    VALUES (%s)
+                    """,
+                    (user_id,),
+                )
 
             cur.execute(
                 """
@@ -1048,6 +1065,87 @@ Do not explain.
 Do not add information that is not visible.
 """
 
+@app.get("/teaching-profile")
+def get_teaching_profile(current_user : int = Depends(get_current_user)):
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT preferences, evidence, confidence, user_override
+            FROM teaching_profiles
+            WHERE user_id = %s
+            """,
+            (current_user,)
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(
+            status_code= 404,
+            detail = "Teaching profile not found"
+        )
+
+    return {
+        "preferences" : row[0],
+        "evidence" : row[1],
+        "confidence" : row[2],
+        "user_override" : row[3]
+    }  
+
+@app.put("/teaching-profile")
+def update_teaching_profile(
+    data: TeachingProfileUpdate,
+    current_user: int = Depends(get_current_user)
+):
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT preferences, user_override
+            FROM teaching_profiles
+            WHERE user_id = %s
+            """,
+            (current_user,)
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Teaching profile not found"
+            )
+
+        current_preferences = row[0] or {}
+        current_overrides = row[1] or {}
+
+        # Merge only the fields explicitly changed by the user
+        current_preferences.update(data.preferences)
+        current_overrides.update(data.preferences)
+
+        cur.execute(
+            """
+            UPDATE teaching_profiles
+            SET
+                preferences = %s,
+                user_override = %s,
+                updated_at = NOW()
+            WHERE user_id = %s
+            RETURNING preferences, evidence, confidence, user_override
+            """,
+            (
+                json.dumps(current_preferences),
+                json.dumps(current_overrides),
+                current_user
+            )
+        )
+
+        updated_row = cur.fetchone()
+
+    return {
+        "preferences": updated_row[0],
+        "evidence": updated_row[1],
+        "confidence": updated_row[2],
+        "user_override": updated_row[3]
+    }  
+
 
 def extract_text_from_scanned_pdf(pdf_bytes: bytes) -> str:
     import fitz
@@ -1091,20 +1189,29 @@ def extract_pdf_source(pdf_bytes: bytes):
     reader = PdfReader(io.BytesIO(pdf_bytes))
 
     page_texts = []
+    locations = []
 
-    for page in reader.pages:
+    for page_number, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
-        page_texts.append(text.strip())
+        text = text.strip()
 
-    combined_text = "\n\n".join(
-        text for text in page_texts if text
-    ).strip()
+        if text:
+            page_texts.append(text)
+
+            locations.append({
+                "type": "page",
+                "value": page_number,
+                "text": text
+            })
+
+    combined_text = "\n\n".join(page_texts).strip()
 
     if combined_text:
         return {
             "text": combined_text,
             "pages": len(reader.pages),
-            "extraction_method": "pypdf"
+            "extraction_method": "pypdf",
+            "locations": locations
         }
 
     scanned_text = extract_text_from_scanned_pdf(pdf_bytes)
@@ -1112,7 +1219,14 @@ def extract_pdf_source(pdf_bytes: bytes):
     return {
         "text": scanned_text,
         "pages": len(reader.pages),
-        "extraction_method": "claude_vision"
+        "extraction_method": "claude_vision",
+        "locations": [
+            {
+                "type": "page",
+                "value": page_number
+            }
+            for page_number in range(1, len(reader.pages) + 1)
+        ]
     }
 
 def extract_docx_source(file_bytes : bytes):
@@ -1136,31 +1250,57 @@ def extract_docx_source(file_bytes : bytes):
 def extract_pptx_source(file_bytes: bytes):
     presentation = Presentation(io.BytesIO(file_bytes))
 
-    slides_text = []
+    slides = []
+    all_slide_text = []
 
-    for slide_number, slide in enumerate(presentation.slides, start=1):
-        slide_parts = []
+    for slide_number, slide in enumerate(
+        presentation.slides,
+        start=1
+    ):
+        elements = []
+        slide_text_parts = []
 
         for shape in slide.shapes:
-            if hasattr(shape, "text"):
-                text = shape.text.strip()
 
-                if text:
-                    slide_parts.append(text)
+            if not hasattr(shape, "text"):
+                continue
 
-        if slide_parts:
-            slide_text = "\n\n".join(slide_parts)
-            slides_text.append(
+            text = shape.text.strip()
+
+            if not text:
+                continue
+
+            elements.append({
+                "type": "text",
+                "content": text
+            })
+
+            slide_text_parts.append(text)
+
+        slide_text = "\n\n".join(slide_text_parts).strip()
+
+        slides.append({
+            "type": "slide",
+            "number": slide_number,
+            "elements": elements,
+            "text": slide_text
+        })
+
+        if slide_text:
+            all_slide_text.append(
                 f"--- SLIDE {slide_number} ---\n{slide_text}"
             )
 
-    extracted_text = "\n\n".join(slides_text)
+    extracted_text = "\n\n".join(all_slide_text)
 
     return {
         "text": extracted_text,
         "pages": len(presentation.slides),
-        "extraction_method": "python_pptx"
+        "extraction_method": "python_pptx",
+        "structure": slides
     }
+
+
 
 def extract_text_source(file_bytes: bytes):
     extracted_text = file_bytes.decode("utf-8")
