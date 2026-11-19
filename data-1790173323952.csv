@@ -1,0 +1,84 @@
+"table_name","column_name","data_type","udt_name","is_nullable","column_default"
+"auth_accounts","id","integer","int4","NO","nextval('auth_accounts_id_seq'::regclass)"
+"auth_accounts","user_id","integer","int4","NO",NULL
+"auth_accounts","provider","character varying","varchar","NO",NULL
+"auth_accounts","provider_user_id","text","text","NO",NULL
+"auth_accounts","created_at","timestamp with time zone","timestamptz","NO","now()"
+"companions","id","integer","int4","NO","nextval('companions_id_seq'::regclass)"
+"companions","user_id","integer","int4","NO",NULL
+"companions","name","character varying","varchar","NO",NULL
+"companions","gender","character varying","varchar","NO",NULL
+"companions","personality_mode","USER-DEFINED","personality_mode","NO","'funny_sarcastic'::personality_mode"
+"companions","created_at","timestamp with time zone","timestamptz","NO","now()"
+"login_attempts","email","character varying","varchar","NO",NULL
+"login_attempts","attempts","integer","int4","NO","0"
+"login_attempts","locked_until","timestamp with time zone","timestamptz","YES",NULL
+"note_blocks","id","integer","int4","NO","nextval('note_blocks_id_seq'::regclass)"
+"note_blocks","note_id","integer","int4","NO",NULL
+"note_blocks","block_type","character varying","varchar","NO",NULL
+"note_blocks","content","jsonb","jsonb","NO",NULL
+"note_blocks","source_reference","text","text","YES",NULL
+"note_blocks","metadata","jsonb","jsonb","YES",NULL
+"note_blocks","order_index","integer","int4","NO",NULL
+"notes","id","integer","int4","NO","nextval('notes_id_seq'::regclass)"
+"notes","user_id","integer","int4","NO",NULL
+"notes","source_id","integer","int4","NO",NULL
+"notes","style_profile_id","integer","int4","YES",NULL
+"notes","generated_content","jsonb","jsonb","NO",NULL
+"notes","created_at","timestamp with time zone","timestamptz","NO","now()"
+"oauth_states","state","character varying","varchar","NO",NULL
+"oauth_states","code_verifier","text","text","YES",NULL
+"oauth_states","created_at","timestamp with time zone","timestamptz","NO","now()"
+"oauth_states","expires_at","timestamp with time zone","timestamptz","NO",NULL
+"otp_codes","id","integer","int4","NO","nextval('otp_codes_id_seq'::regclass)"
+"otp_codes","user_id","integer","int4","NO",NULL
+"otp_codes","email","character varying","varchar","NO",NULL
+"otp_codes","purpose","character varying","varchar","NO",NULL
+"otp_codes","otp_hash","character varying","varchar","NO",NULL
+"otp_codes","attempts","integer","int4","NO","0"
+"otp_codes","created_at","timestamp with time zone","timestamptz","NO","now()"
+"otp_codes","expires_at","timestamp with time zone","timestamptz","NO",NULL
+"quiz_attempts","id","integer","int4","NO","nextval('quiz_attempts_id_seq'::regclass)"
+"quiz_attempts","quiz_id","integer","int4","NO",NULL
+"quiz_attempts","user_id","integer","int4","NO",NULL
+"quiz_attempts","score","integer","int4","NO",NULL
+"quiz_attempts","time_taken_seconds","numeric","numeric","YES",NULL
+"quiz_attempts","attempted_at","timestamp with time zone","timestamptz","NO","now()"
+"quizzes","id","integer","int4","NO","nextval('quizzes_id_seq'::regclass)"
+"quizzes","note_id","integer","int4","NO",NULL
+"quizzes","questions_json","jsonb","jsonb","NO","'[]'::jsonb"
+"quizzes","created_at","timestamp with time zone","timestamptz","NO","now()"
+"refresh_sessions","id","integer","int4","NO","nextval('refresh_sessions_id_seq'::regclass)"
+"refresh_sessions","user_id","integer","int4","NO",NULL
+"refresh_sessions","token_hash","text","text","NO",NULL
+"refresh_sessions","expires_at","timestamp with time zone","timestamptz","NO",NULL
+"refresh_sessions","created_at","timestamp with time zone","timestamptz","NO","now()"
+"refresh_sessions","revoked_at","timestamp with time zone","timestamptz","YES",NULL
+"refresh_sessions","last_used_at","timestamp with time zone","timestamptz","YES",NULL
+"sources","id","integer","int4","NO","nextval('sources_id_seq'::regclass)"
+"sources","user_id","integer","int4","NO",NULL
+"sources","filename","text","text","NO",NULL
+"sources","extracted_text","text","text","NO",NULL
+"sources","uploaded_at","timestamp with time zone","timestamptz","NO","now()"
+"sources","characters_extracted","integer","int4","YES",NULL
+"sources","extraction_type","text","text","YES",NULL
+"style_profiles","id","integer","int4","NO","nextval('style_profiles_id_seq'::regclass)"
+"style_profiles","user_id","integer","int4","NO",NULL
+"style_profiles","sample_notes_txt","text","text","YES",NULL
+"style_profiles","text_style","text","text","YES",NULL
+"style_profiles","analysed_style","text","text","YES",NULL
+"style_profiles","created_at","timestamp with time zone","timestamptz","NO","now()"
+"users","id","integer","int4","NO","nextval('users_id_seq'::regclass)"
+"users","name","character varying","varchar","NO",NULL
+"users","email","character varying","varchar","NO",NULL
+"users","hashed_pass","character varying","varchar","YES",NULL
+"users","email_verified","boolean","bool","NO","false"
+"users","created_at","timestamp with time zone","timestamptz","NO","now()"
+"users","auth_version","integer","int4","NO","0"
+"weak_topics","id","integer","int4","NO","nextval('weak_topics_id_seq'::regclass)"
+"weak_topics","user_id","integer","int4","NO",NULL
+"weak_topics","note_block_id","integer","int4","YES",NULL
+"weak_topics","latest_score","integer","int4","YES",NULL
+"weak_topics","status","USER-DEFINED","topic_status","NO",NULL
+"weak_topics","next_review","timestamp with time zone","timestamptz","YES",NULL
+"weak_topics","updated_at","timestamp with time zone","timestamptz","NO","now()"

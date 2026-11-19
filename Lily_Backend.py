@@ -1,39 +1,91 @@
 import base64
-import io
 import json
 import logging
 import re
 import secrets
 import hashlib
 import hmac
+import os
+import time
+
 from pathlib import Path
 from contextlib import contextmanager
-from datetime import datetime, timedelta , timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
+import resend
+
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from psycopg2.pool import ThreadedConnectionPool
+
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
+
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from google_auth_oauthlib.flow import Flow
+
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel , Field , ValidationError , ConfigDict
-from typing import Any , Literal
-from pypdf import PdfReader
-from docx import Document
-from pptx import Presentation
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+)
+
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-import os
-import resend
+from source_engine.storage.source_storage import (
+    calculate_file_hash,
+    build_storage_key,
+    save_source_file,
+    delete_source_file,
+    read_source_file,
+)
+
+from source_engine.discovery.persistence import (
+    persist_discovery,
+)
+
+from source_engine.discovery.source_discovery import (
+    discover_source as run_source_discovery,
+)
+
+from source_engine.knowledge.source_knowledge_tool import (
+    get_source_knowledge,
+)
+
+from source_engine.embeddings.discovery_embedding_pipeline import (
+    embed_source_units,
+)
+
+from source_engine.embeddings.source_embedding_pipeline import (
+    embed_source,
+)
+
+import requests
+
+from source_engine.knowledge.user_source_knowledge import (
+    get_user_source_knowledge,
+)
 
 
 load_dotenv()
@@ -96,6 +148,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+LILY_BRAIN_URL = "http://127.0.0.1:8082/v1/chat/completions"
+LILY_BRAIN_MODEL = "Qwen/Qwen3-4B-GGUF:Q4_K_M"
 
 anthropic_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -446,6 +502,8 @@ def send_password_reset_email(email: str, otp: str):
             detail="Failed to send password reset email"
         )
 
+ 
+
 
 class UserRegister(BaseModel):
     name: str
@@ -482,16 +540,12 @@ class UserCompanion(BaseModel):
     personality_mode : str = "funny_sarcastic"
 
 
-class UserStyleProfile(BaseModel):
-    text: str | None = None
-    image_base64: str | None = None
 
 class TeachingProfileUpdate(BaseModel):
-    preferences : dict[str , Any] = {}    
+    preferences: dict[str, Any] = Field(default_factory=dict)   
 
 
 class GenerateNoteRequest(BaseModel):
-    source_id: int
     topic: str
 
 class RefreshTokenRequest(BaseModel):
@@ -519,7 +573,11 @@ class GeneratedNote(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     title: str
-    blocks: list[NoteBlock]     
+    blocks: list[NoteBlock]
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id : int | None = None         
 
 
 @app.get("/")
@@ -983,17 +1041,46 @@ note-taking style.
 
 @app.post("/style-profile")
 @limiter.limit(CLAUDE_ENDPOINT_RATE_LIMIT)
-def create_style_profile(request: Request, profile: UserStyleProfile, current_user: int = Depends(get_current_user)):
-    text_style = None
+async def create_style_profile(
+    request: Request,
+    text: str | None = None,
+    image: UploadFile | None = File(None),
+    current_user: int = Depends(get_current_user),
+):
+    text_style = text.strip() if text and text.strip() else None
     analysed_style = None
 
 
-    sample_notes_txt = None
+    if text_style is None and image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of text or image must be provided"
+        )
 
-    if profile.text and profile.text.strip():
-        text_style = profile.text.strip()
+    if image is not None:
+        allowed_types = {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
 
-    if profile.image_base64:
+        if image.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported image type. Use JPEG, PNG, or WEBP."
+            )
+
+        image_bytes = await image.read()
+
+        if not image_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded image is empty"
+            )
+
+        # Convert image bytes to Base64 for Claude
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
         try:
             response = anthropic_client.messages.create(
                 model="claude-sonnet-5",
@@ -1006,64 +1093,72 @@ def create_style_profile(request: Request, profile: UserStyleProfile, current_us
                                 "type": "image",
                                 "source": {
                                     "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": profile.image_base64,
+                                    "media_type": image.content_type,
+                                    "data": image_b64,
                                 },
                             },
-                            {"type": "text", "text": STYLE_ANALYSIS_PROMPT},
+                            {
+                                "type": "text",
+                                "text": STYLE_ANALYSIS_PROMPT,
+                            },
                         ],
                     }
                 ],
             )
+
             analysed_style = response.content[0].text.strip()
+
         except Exception as e:
             logger.exception("Style image analysis failed")
-            raise HTTPException(status_code=502, detail=f"Failed to analyze image: {e}")
-
-    if text_style is None and analysed_style is None:
-        raise HTTPException(status_code=400, detail="No text or image provided")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to analyze image: {e}"
+            )
 
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO style_profiles (user_id, sample_notes_txt, text_style, analysed_style)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO style_profiles
+                (user_id, sample_notes_txt, text_style, analysed_style)
+            VALUES
+                (%s, %s, %s, %s)
+
             ON CONFLICT (user_id) DO UPDATE SET
-                sample_notes_txt = EXCLUDED.sample_notes_txt,
-                text_style = EXCLUDED.text_style,
-                analysed_style = EXCLUDED.analysed_style
-            RETURNING id;
+
+                text_style = COALESCE(
+                    EXCLUDED.text_style,
+                    style_profiles.text_style
+                ),
+
+                analysed_style = COALESCE(
+                    EXCLUDED.analysed_style,
+                    style_profiles.analysed_style
+                )
+
+            RETURNING
+                id,
+                text_style,
+                analysed_style;
             """,
-            (current_user, sample_notes_txt, text_style, analysed_style),
+            (
+                current_user,
+                None,
+                text_style,
+                analysed_style,
+            ),
         )
-        style_profile_id = cur.fetchone()[0]
+
+        row = cur.fetchone()
+
 
     return {
         "message": "Style profile saved",
-        "style_profile_id": style_profile_id,
+        "style_profile_id": row[0],
         "user_id": current_user,
-        "text_style": text_style,
-        "analysed_style": analysed_style,
+        "text_style": row[1],
+        "analysed_style": row[2],
     }
 
-
-SCANNED_PAGE_TRANSCRIPTION_PROMPT = """
-Transcribe all handwritten and printed text visible in this page.
-
-Return only the text itself.
-
-Preserve:
-- headings
-- bullet points
-- numbered lists
-- equations
-- important symbols
-- line breaks where they are meaningful
-
-Do not summarize.
-Do not explain.
-Do not add information that is not visible.
-"""
 
 @app.get("/teaching-profile")
 def get_teaching_profile(current_user : int = Depends(get_current_user)):
@@ -1144,287 +1239,456 @@ def update_teaching_profile(
         "evidence": updated_row[1],
         "confidence": updated_row[2],
         "user_override": updated_row[3]
-    }  
+    }
 
+def run_lightweight_discovery(
+    source_id: int,
+    user_id: int,
+) -> dict:
 
-def extract_text_from_scanned_pdf(pdf_bytes: bytes) -> str:
-    import fitz
+    with db_cursor() as cur:
 
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    extracted_text = ""
-
-    for page_number, page in enumerate(document, start=1):
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        image_bytes = pixmap.tobytes("jpeg")
-        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_base64,
-                            },
-                        },
-                        {"type": "text", "text": SCANNED_PAGE_TRANSCRIPTION_PROMPT},
-                    ],
-                }
-            ],
+        cur.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                filename,
+                source_type,
+                storage_key,
+                discovery_status
+            FROM sources
+            WHERE id = %s
+              AND user_id = %s;
+            """,
+            (
+                source_id,
+                user_id,
+            ),
         )
 
-        page_text = "".join(block.text for block in response.content if block.type == "text")
-        extracted_text += f"\n--- PAGE {page_number} ---\n{page_text}"
+        source = cur.fetchone()
 
-    document.close()
-    return extracted_text.strip()
-
-def extract_pdf_source(pdf_bytes: bytes):
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-
-    page_texts = []
-    locations = []
-
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = text.strip()
-
-        if text:
-            page_texts.append(text)
-
-            locations.append({
-                "type": "page",
-                "value": page_number,
-                "text": text
-            })
-
-    combined_text = "\n\n".join(page_texts).strip()
-
-    if combined_text:
-        return {
-            "text": combined_text,
-            "pages": len(reader.pages),
-            "extraction_method": "pypdf",
-            "locations": locations
-        }
-
-    scanned_text = extract_text_from_scanned_pdf(pdf_bytes)
-
-    return {
-        "text": scanned_text,
-        "pages": len(reader.pages),
-        "extraction_method": "claude_vision",
-        "locations": [
-            {
-                "type": "page",
-                "value": page_number
-            }
-            for page_number in range(1, len(reader.pages) + 1)
-        ]
-    }
-
-def extract_docx_source(file_bytes : bytes):
-    document = Document(io.BytesIO(file_bytes))
-
-    paragraphs = []
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-
-        if text:
-            paragraphs.append(text)
-
-    extracted_text = "\n\n".join(paragraphs)
-
-    return{
-        "text" : extracted_text,
-        "pages" : None,
-        "extraction_method" : "python_docx"
-    } 
-
-def extract_pptx_source(file_bytes: bytes):
-    presentation = Presentation(io.BytesIO(file_bytes))
-
-    slides = []
-    all_slide_text = []
-
-    for slide_number, slide in enumerate(
-        presentation.slides,
-        start=1
-    ):
-        elements = []
-        slide_text_parts = []
-
-        for shape in slide.shapes:
-
-            if not hasattr(shape, "text"):
-                continue
-
-            text = shape.text.strip()
-
-            if not text:
-                continue
-
-            elements.append({
-                "type": "text",
-                "content": text
-            })
-
-            slide_text_parts.append(text)
-
-        slide_text = "\n\n".join(slide_text_parts).strip()
-
-        slides.append({
-            "type": "slide",
-            "number": slide_number,
-            "elements": elements,
-            "text": slide_text
-        })
-
-        if slide_text:
-            all_slide_text.append(
-                f"--- SLIDE {slide_number} ---\n{slide_text}"
+        if source is None:
+            raise ValueError(
+                f"Source {source_id} not found for user {user_id}"
             )
 
-    extracted_text = "\n\n".join(all_slide_text)
+        (
+            source_id,
+            user_id,
+            filename,
+            source_type,
+            storage_key,
+            discovery_status,
+        ) = source
+
+        cur.execute(
+            """
+            UPDATE sources
+            SET discovery_status = 'discovering'
+            WHERE id = %s;
+            """,
+            (source_id,),
+        )
+
+    try:
+
+        file_bytes = read_source_file(
+            storage_key
+        )
+
+        result = run_source_discovery(
+            file_bytes=file_bytes,
+            source_type=source_type,
+            file_name=filename,
+        )
+
+        with db_cursor() as cur:
+
+            summary = persist_discovery(
+                cur=cur,
+                source_id=source_id,
+                result=result,
+            )
+
+            embeddings_written = embed_source_units(
+                cur=cur,
+                source_id=source_id,
+            )
+
+            source_embedding_written = embed_source(
+                cur=cur,
+                source_id=source_id,
+            )
+
+            print(
+                f"[DISCOVERY] source={source_id} "
+                f"unit_embeddings={embeddings_written} "
+                f"source_embedding={source_embedding_written}"
+            )
+
+            print(
+                f"[DISCOVERY] source={source_id} "
+                f"lightweight pipeline finished"
+            )
+
+            cur.execute(
+                """
+                UPDATE sources
+                SET discovery_status = 'discovered'
+                WHERE id = %s;
+                """,
+                (source_id,),
+            )
+
+            print(
+                f"[DISCOVERY] source={source_id} "
+                f"status=discovered"
+            )
+
+        return {
+            "source_id": source_id,
+            "filename": filename,
+            "source_type": source_type,
+            "discovery_embeddings_written": embeddings_written,
+            "source_embedding_written": source_embedding_written,
+            **summary,
+        }
+
+    except Exception as exc:
+
+        print("\n" + "=" * 70)
+        print(
+            f"[DISCOVERY FAILED] source_id={source_id}"
+        )
+        print(
+            f"[DISCOVERY ERROR] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        print("=" * 70)
+
+        logger.exception(
+            "Lightweight discovery failed for source %s",
+            source_id,
+        )
+
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE sources
+                SET discovery_status = 'failed'
+                WHERE id = %s;
+                """,
+                (source_id,),
+            )
+
+        raise
+
+
+@app.post("/discover-source/{source_id}")
+def discover_source(
+    source_id: int,
+    current_user: int = Depends(get_current_user),
+):
+    try:
+        summary = run_lightweight_discovery(
+            source_id=source_id,
+            user_id=current_user,
+        )
+
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail="Source not found",
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Source discovery failed: {exc}",
+        )
 
     return {
-        "text": extracted_text,
-        "pages": len(presentation.slides),
-        "extraction_method": "python_pptx",
-        "structure": slides
+        "message": "Source discovery completed",
+        **summary,
     }
-
-
-
-def extract_text_source(file_bytes: bytes):
-    extracted_text = file_bytes.decode("utf-8")
-
-    return {
-        "text": extracted_text,
-        "pages": None,
-        "extraction_method": "utf8"
-    }
-
-def extract_image_source(file_bytes: bytes, media_type: str):
-    image_base64 = base64.b64encode(file_bytes).decode("utf-8")
-
-    response = anthropic_client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=4096,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_base64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": SCANNED_PAGE_TRANSCRIPTION_PROMPT,
-                    },
-                ],
-            }
-        ],
-    )
-
-    extracted_text = "".join(
-        block.text
-        for block in response.content
-        if block.type == "text"
-    ).strip()
-
-    return {
-        "text": extracted_text,
-        "pages": None,
-        "extraction_method": "claude_vision"
-    }
-
 
 
 @app.post("/upload-source")
 @limiter.limit(CLAUDE_ENDPOINT_RATE_LIMIT)
 async def upload_source(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    current_user: int = Depends(get_current_user)
+    current_user: int = Depends(get_current_user),
 ):
-    pdf_bytes = await file.read()
 
-    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+    if not file.filename:
         raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+            status_code=400,
+            detail="Filename is required",
         )
 
-    filename = file.filename.lower()
+    original_filename = file.filename
 
-    if filename.endswith(".pdf"):
-        result = extract_pdf_source(pdf_bytes)
- 
-    elif filename.endswith(".docx"):
-       result = extract_docx_source(pdf_bytes)
+    extension = Path(
+        original_filename.lower()
+    ).suffix
 
-    elif filename.endswith(".pptx"):
-      result = extract_pptx_source(pdf_bytes)
+    allowed_extensions = {
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".txt",
+        ".md",
+        ".jpeg",
+        ".jpg",
+        ".png",
+        ".webp",
+    }
 
-    elif filename.endswith(".txt") or filename.endswith(".md"):
-        result = extract_text_source(pdf_bytes) 
+    if extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format",
+        )
 
-    elif filename.endswith((".jpeg" , ".jpg", ".png" ,".webp")):
-        result = extract_image_source(pdf_bytes,
-             file.content_type)     
-    else:
-      raise HTTPException(
-        status_code=400,
-        detail="Unsupported file format"
+    file_bytes = await file.read()
+
+    if not file_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty",
+        )
+
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "File too large. Maximum size is "
+                f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB"
+            ),
+        )
+
+    source_type_map = {
+        ".pdf": "pdf",
+        ".docx": "docx",
+        ".pptx": "pptx",
+        ".txt": "txt",
+        ".md": "md",
+        ".jpeg": "image",
+        ".jpg": "image",
+        ".png": "image",
+        ".webp": "image",
+    }
+
+    source_type = source_type_map[extension]
+
+    file_hash = calculate_file_hash(
+        file_bytes
     )
-
-    extracted_text = result["text"]
-
-    if not extracted_text:
-        return {
-            "message": "Could not extract any text from this PDF",
-            "filename": file.filename,
-            "pages": result["pages"],
-            "characters_extracted": 0,
-            "extraction_method": result["extraction_method"],
-        }
 
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO sources (user_id, filename, extracted_text ,
-            characters_extracted, extraction_type)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id;
+            SELECT
+                id,
+                filename,
+                storage_key,
+                discovery_status
+            FROM sources
+            WHERE user_id = %s
+              AND file_hash = %s
+            ORDER BY id
+            LIMIT 1;
             """,
-            (current_user, file.filename, extracted_text,
-             len(extracted_text), result["extraction_method"]),
+            (
+                current_user,
+                file_hash,
+            ),
         )
 
-        source_id = cur.fetchone()[0]
+        existing_source = cur.fetchone()
+
+    if existing_source:
+
+        existing_source_id = existing_source[0]
+        existing_filename = existing_source[1]
+        existing_storage_key = existing_source[2]
+        existing_status = str(
+            existing_source[3]
+        )
+
+        if existing_status != "failed":
+            return {
+                "message": "Source already registered",
+                "source_id": existing_source_id,
+                "user_id": current_user,
+                "filename": existing_filename,
+                "storage_key": existing_storage_key,
+                "source_type": source_type,
+                "discovery_status": existing_status,
+                "reused": True,
+            }
+
+        try:
+            save_source_file(
+                file_bytes=file_bytes,
+                storage_key=existing_storage_key,
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to store retry source"
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to store source",
+            )
+
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE sources
+                SET
+                    filename = %s,
+                    source_type = %s,
+                    discovery_status = 'pending',
+                    source_metadata = %s::jsonb
+                WHERE id = %s
+                  AND user_id = %s;
+                """,
+                (
+                    original_filename,
+                    source_type,
+                    json.dumps({
+                        "size_bytes": len(file_bytes),
+                        "extension": extension,
+                    }),
+                    existing_source_id,
+                    current_user,
+                ),
+            )
+
+        background_tasks.add_task(
+            run_lightweight_discovery,
+            existing_source_id,
+            current_user,
+        )
+
+        return {
+            "message": "Failed source retry started",
+            "source_id": existing_source_id,
+            "user_id": current_user,
+            "filename": original_filename,
+            "source_type": source_type,
+            "storage_key": existing_storage_key,
+            "discovery_status": "pending",
+            "size_bytes": len(file_bytes),
+            "reused": True,
+            "retry": True,
+        }
+
+    storage_key = build_storage_key(
+        user_id=current_user,
+        file_hash=file_hash,
+        filename=original_filename,
+    )
+
+    try:
+        save_source_file(
+            file_bytes=file_bytes,
+            storage_key=storage_key,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to store original source"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to store source",
+        )
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sources (
+                    user_id,
+                    filename,
+                    source_type,
+                    file_hash,
+                    storage_key,
+                    discovery_status,
+                    source_metadata
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    'pending',
+                    %s::jsonb
+                )
+                RETURNING id;
+                """,
+                (
+                    current_user,
+                    original_filename,
+                    source_type,
+                    file_hash,
+                    storage_key,
+                    json.dumps({
+                        "size_bytes": len(file_bytes),
+                        "extension": extension,
+                    }),
+                ),
+            )
+
+            source_id = cur.fetchone()[0]
+
+    except Exception:
+        logger.exception(
+            "Failed to register source"
+        )
+
+        try:
+            delete_source_file(
+                storage_key
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to clean orphaned source file"
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to register source",
+        )
+
+    background_tasks.add_task(
+        run_lightweight_discovery,
+        source_id,
+        current_user,
+    )
 
     return {
         "message": "Source uploaded successfully",
         "source_id": source_id,
         "user_id": current_user,
-        "filename": file.filename,
-        "pages": result["pages"],
-        "characters_extracted": len(extracted_text),
-        "extraction_method": result["extraction_method"],
+        "filename": original_filename,
+        "source_type": source_type,
+        "storage_key": storage_key,
+        "discovery_status": "pending",
+        "size_bytes": len(file_bytes),
+        "reused": False,
     }
-
 
 
 NOTE_BLOCK_SCHEMA_EXAMPLE = """
@@ -1484,9 +1748,8 @@ SOURCE MATERIAL:
 {source_text}
 
 
-==================================================
 1. SOURCE AND KNOWLEDGE BOUNDARY
-==================================================
+
 
 The source material is the primary reference for what the notes are about.
 
@@ -1518,9 +1781,9 @@ You must independently verify important claims before presenting them
 as established facts.
 
 
-==================================================
+
 2. CLAIM VERIFICATION
-==================================================
+
 
 Before generating the final notes, internally examine important claims
 in the source.
@@ -1549,9 +1812,9 @@ check whether the example actually satisfies the relevant definition.
 Do NOT accept an argument merely because it sounds convincing.
 
 
-==================================================
+
 3. SOURCE ERROR DETECTION
-==================================================
+
 
 If a source statement is demonstrably incorrect, DO NOT silently reproduce it.
 
@@ -1576,9 +1839,9 @@ If a statement is unusual but potentially valid, do not correct it merely
 because it differs from your expectations.
 
 
-==================================================
+
 4. UNCERTAINTY
-==================================================
+
 
 If you cannot confidently determine whether an important source statement
 is correct, DO NOT guess.
@@ -1595,9 +1858,9 @@ The student must be able to distinguish between:
 - claims requiring further verification
 
 
-==================================================
+
 5. MATHEMATICAL AND TECHNICAL SAFETY
-==================================================
+
 
 For mathematics, computer science, engineering, physics, statistics,
 machine learning, and other technical subjects:
@@ -1621,9 +1884,8 @@ If a theorem or definition is stated incorrectly, clearly distinguish
 the source statement from the corrected version.
 
 
-==================================================
 6. SOURCE REFERENCES
-==================================================
+
 
 Whenever possible, associate important content with its location in
 the source.
@@ -1636,9 +1898,9 @@ DO NOT invent page numbers or source references.
 If an exact source location cannot be determined, omit the reference.
 
 
-==================================================
+
 7. PERSONALIZED NOTE STYLE
-==================================================
+
 
 The user's declared and analysed writing style should affect ONLY
 presentation.
@@ -1662,9 +1924,9 @@ explanations because they resemble the user's notes.
 Do not mention the style profile in the generated notes.
 
 
-==================================================
+
 8. TOPIC RELEVANCE
-==================================================
+
 
 Focus on:
 
@@ -1679,9 +1941,9 @@ Include prerequisite information only when it is necessary to understand
 the requested topic.
 
 
-==================================================
+
 9. TRANSPARENT CORRECTIONS
-==================================================
+
 
 Never silently replace an incorrect source statement with a corrected one.
 
@@ -1697,9 +1959,9 @@ SOURCE CLAIM
 → EXPLANATION
 
 
-==================================================
+
 10. OUTPUT BLOCK TYPES
-==================================================
+
 
 Use only these block types:
 
@@ -1714,9 +1976,9 @@ correction
 verification_note
 
 
-==================================================
+
 11. BLOCK RULES
-==================================================
+
 
 heading:
 Used for section titles.
@@ -1748,9 +2010,9 @@ verification_note:
 Used when an important source claim cannot be confidently verified.
 
 
-==================================================
+
 12. CORRECTION BLOCK
-==================================================
+
 
 Every correction block must communicate:
 
@@ -1766,9 +2028,9 @@ be clearer.
 A correction means the original claim is actually wrong.
 
 
-==================================================
+
 13. VERIFICATION NOTE
-==================================================
+
 
 Use the verification_note structure defined in the JSON schema below.
 
@@ -1777,9 +2039,9 @@ Only use it when an important source claim cannot be confidently verified.
 Do not use verification_note for ordinary stylistic issues.
 
 
-==================================================
+
 14. NO HALLUCINATED EXAMPLES
-==================================================
+
 
 Do not create new worked examples merely to make the notes look better.
 
@@ -1798,9 +2060,9 @@ When explaining a correction, use reasoning and explanation rather than
 inventing a new worked example.
 
 
-==================================================
+
 15. FINAL INTERNAL AUDIT
-==================================================
+
 
 Before producing the JSON, internally check every generated block.
 
@@ -1822,9 +2084,9 @@ Check:
 If a block fails these checks, revise or remove it before returning JSON.
 
 
-==================================================
+
 16. INSUFFICIENT SOURCE INFORMATION
-==================================================
+
 
 If the source does not contain enough reliable information to generate
 a complete note about the requested topic:
@@ -1837,9 +2099,9 @@ does not contain enough reliable information for that part of the topic.
 A shorter correct note is better than a longer hallucinated note.
 
 
-==================================================
+
 17. JSON OUTPUT
-==================================================
+
 
 Return ONLY valid JSON.
 
@@ -1871,25 +2133,91 @@ FINAL RULE:
 Accuracy is more important than completeness.
 """
 
+def build_note_source_context(
+    chunks: list[dict],
+) -> str:
+    """
+    Convert retrieved Source Engine chunks into grounded context
+    for note generation.
+    """
+
+    parts = []
+
+    for index, chunk in enumerate(
+        chunks,
+        start=1,
+    ):
+        retrieval_text = chunk.get(
+            "retrieval_text",
+            ""
+        )
+
+        if not isinstance(
+            retrieval_text,
+            str,
+        ):
+            continue
+
+        retrieval_text = retrieval_text.strip()
+
+        if not retrieval_text:
+            continue
+
+        unit_index = chunk.get(
+            "unit_index"
+        )
+
+        chunk_index = chunk.get(
+            "chunk_index"
+        )
+
+        reference_parts = []
+
+        if unit_index is not None:
+            reference_parts.append(
+                f"unit {unit_index}"
+            )
+
+        if chunk_index is not None:
+            reference_parts.append(
+                f"chunk {chunk_index}"
+            )
+
+        if reference_parts:
+            reference = " | ".join(
+                reference_parts
+            )
+        else:
+            reference = f"retrieved result {index}"
+
+        parts.append(
+            f"[Source evidence: {reference}]\n"
+            f"{retrieval_text}"
+        )
+
+    return "\n\n".join(parts).strip()
+
 
 @app.post("/generate-note")
 @limiter.limit(CLAUDE_ENDPOINT_RATE_LIMIT)
 def generate_note(
     request: Request,
     payload: GenerateNoteRequest,
-    current_user: int = Depends(get_current_user)
+    current_user: int = Depends(get_current_user),
 ):
+    topic = payload.topic.strip()
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="Topic cannot be empty")
+
     with db_cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             SELECT id, text_style, analysed_style
             FROM style_profiles
             WHERE user_id = %s
             ORDER BY created_at DESC
             LIMIT 1;
-            """,
-            (current_user,),
-        )
+        """, (current_user,))
 
         style_result = cur.fetchone()
 
@@ -1901,51 +2229,89 @@ def generate_note(
 
         style_profile_id, text_style, analysed_style = style_result
 
-        cur.execute(
-            """
-            SELECT id, extracted_text
+        try:
+            knowledge = get_user_source_knowledge(
+                cur=cur,
+                user_id=current_user,
+                query=topic,
+                source_top_k=3,
+                chunk_top_k=8,
+                allow_targeted_ingestion=True,
+            )
+        except Exception:
+            logger.exception("Source knowledge retrieval failed")
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to retrieve source knowledge"
+            )
+
+        source_chunks = knowledge.get("chunks", [])
+
+        if not source_chunks:
+            raise HTTPException(
+                status_code=422,
+                detail="No relevant source knowledge was found for the requested topic"
+            )
+
+        source_text = build_note_source_context(source_chunks)
+
+        if not source_text:
+            raise HTTPException(
+                status_code=422,
+                detail="No usable source evidence was found for the requested topic"
+            )
+
+        primary_source_id = source_chunks[0].get("source_id")
+
+        if primary_source_id is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Retrieved source evidence is missing source information"
+            )
+
+        cur.execute("""
+            SELECT filename
             FROM sources
-            WHERE id = %s AND user_id = %s;
-            """,
-            (payload.source_id, current_user),
-        )
+            WHERE id = %s
+              AND user_id = %s;
+        """, (primary_source_id, current_user))
 
         source_result = cur.fetchone()
 
         if source_result is None:
             raise HTTPException(
-                status_code=404,
-                detail="Source not found for this user"
+                status_code=502,
+                detail="Primary source could not be resolved"
             )
 
-        source_id, source_text = source_result
+        source_filename = source_result[0]
 
     prompt = build_note_prompt(
-        payload.topic,
+        topic,
         text_style,
         analysed_style,
-        source_text
+        source_text,
     )
 
     try:
         response = anthropic_client.messages.create(
-            model = "claude-sonnet-5",
-            max_tokens= 8192,
-            thinking={"type" :"adaptive"},
-            output_config={"effort" : "medium"},
-            messages = [
+            model="claude-sonnet-5",
+            max_tokens=8192,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "medium"},
+            messages=[
                 {
-                    "role" : "user",
-                    "content" : prompt
+                    "role": "user",
+                    "content": prompt,
                 }
             ],
         )
     except Exception:
         logger.exception("Claude API request failed")
         raise HTTPException(
-            status_code = 502,
-            detail= "AI service temporarily unavailable"
-        )    
+            status_code=502,
+            detail="AI service temporarily unavailable"
+        )
 
     response_text = "".join(
         block.text
@@ -1955,20 +2321,14 @@ def generate_note(
 
     try:
         generated_content = json.loads(response_text)
-        validated_note = GeneratedNote.model_validate(
-            generated_content
-        )
-
+        validated_note = GeneratedNote.model_validate(generated_content)
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=502,
             detail="Claude returned invalid JSON"
         )
-
     except ValidationError:
-        logger.exception(
-            "Claude returned invalid note structure"
-        )
+        logger.exception("Claude returned invalid note structure")
         raise HTTPException(
             status_code=502,
             detail="Claude returned an invalid note structure"
@@ -1976,9 +2336,16 @@ def generate_note(
 
     generated_content = validated_note.model_dump()
 
+    evidence_map = {}
+
+    for index, chunk in enumerate(source_chunks, start=1):
+        source_chunk_id = chunk.get("source_chunk_id", chunk.get("id"))
+
+        if source_chunk_id is not None:
+            evidence_map[f"EVIDENCE_{index}"] = source_chunk_id
+
     with db_cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO notes (
                 user_id,
                 source_id,
@@ -1987,20 +2354,16 @@ def generate_note(
             )
             VALUES (%s, %s, %s, %s)
             RETURNING id;
-            """,
-            (
-                current_user,
-                source_id,
-                style_profile_id,
-                json.dumps(generated_content),
-            ),
-        )
+        """, (
+            current_user,
+            primary_source_id,
+            style_profile_id,
+            json.dumps(generated_content),
+        ))
 
         note_id = cur.fetchone()[0]
 
-        blocks = generated_content["blocks"]
-
-        for order_index, block in enumerate(blocks):
+        for order_index, block in enumerate(generated_content["blocks"]):
             block_type = block["type"]
             content = block["content"]
 
@@ -2010,14 +2373,13 @@ def generate_note(
                 if key not in {
                     "type",
                     "content",
-                    "source_reference"
+                    "source_reference",
                 }
             }
 
             source_reference = block.get("source_reference")
 
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO note_blocks (
                     note_id,
                     block_type,
@@ -2026,23 +2388,1183 @@ def generate_note(
                     metadata,
                     order_index
                 )
-                VALUES (%s, %s, %s, %s, %s, %s);
-                """,
-                (
-                    note_id,
-                    block_type,
-                    json.dumps(content),
-                    source_reference,
-                    json.dumps(metadata) if metadata else None,
-                    order_index,
-                ),
-            )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """, (
+                note_id,
+                block_type,
+                json.dumps(content),
+                source_reference,
+                json.dumps(metadata) if metadata else None,
+                order_index,
+            ))
+
+            note_block_id = cur.fetchone()[0]
+
+            if source_reference:
+                evidence_ids = [
+                    part.strip()
+                    for part in source_reference.split(",")
+                ]
+
+                for evidence_id in evidence_ids:
+                    source_chunk_id = evidence_map.get(evidence_id)
+
+                    if source_chunk_id is None:
+                        continue
+
+                    cur.execute("""
+                        INSERT INTO note_block_sources (
+                            note_block_id,
+                            source_chunk_id
+                        )
+                        VALUES (%s, %s)
+                        ON CONFLICT DO NOTHING;
+                    """, (
+                        note_block_id,
+                        source_chunk_id,
+                    ))
 
     return {
         "message": "Note generated successfully",
         "note_id": note_id,
         "user_id": current_user,
-        "source_id": source_id,
+        "source_id": primary_source_id,
+        "source_filename": source_filename,
         "style_profile_id": style_profile_id,
+        "source_cache_status": [
+            source.get("cache_status")
+            for source in knowledge.get("sources", [])
+        ],
         "generated_content": generated_content,
     }
+
+LILY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_source_knowledge",
+            "description": (
+                "Search the student's uploaded learning sources for "
+                "information relevant to their request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The semantic search query describing the "
+                            "knowledge needed from the student's sources."
+                        ),
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
+
+def call_brain(
+    messages: list[dict],
+    *,
+    tools: list[dict] | None = None,
+    tool_choice: str | None = None,
+    temperature: float = 0,
+    max_tokens: int | None = None,
+    timeout: int = 120,
+) -> dict:
+    payload = {
+        "model": LILY_BRAIN_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+    }
+
+    if tools is not None:
+        payload["tools"] = tools
+
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    response = requests.post(
+        LILY_BRAIN_URL,
+        json=payload,
+        timeout=timeout,
+    )
+
+    if not response.ok:
+        print("Brain HTTP error")
+        print("status: ", response.status_code)
+        print("response: ", response.text)
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def compact_brain_knowledge(
+    knowledge: dict,
+    *,
+    max_chunks: int = 5,
+    max_chars_per_chunk: int = 2500,
+    max_total_chars: int = 9000,
+) -> dict:
+    compact_chunks = []
+    total_chars = 0
+
+    chunks = knowledge.get("chunks", [])
+
+    for chunk in chunks[:max_chunks]:
+        retrieval_text = chunk.get(
+            "retrieval_text",
+            "",
+        )
+
+        if not isinstance(retrieval_text, str):
+            continue
+
+        retrieval_text = retrieval_text.strip()
+
+        if not retrieval_text:
+            continue
+
+        remaining_chars = (
+            max_total_chars - total_chars
+        )
+
+        if remaining_chars <= 0:
+            break
+
+        allowed_chars = min(
+            max_chars_per_chunk,
+            remaining_chars,
+        )
+
+        retrieval_text = retrieval_text[
+            :allowed_chars
+        ]
+
+        compact_chunk = {
+            "source_id": chunk.get("source_id"),
+            "source_filename": chunk.get(
+                "source_filename"
+            ),
+            "unit_index": chunk.get("unit_index"),
+            "chunk_index": chunk.get("chunk_index"),
+            "similarity": chunk.get("similarity"),
+            "retrieval_text": retrieval_text,
+        }
+
+        compact_chunks.append(compact_chunk)
+
+        total_chars += len(retrieval_text)
+
+    return {
+        "query": knowledge.get("query"),
+        "knowledge_available": bool(compact_chunks),
+        "chunks": compact_chunks,
+    }
+
+
+def build_lily_system_prompt(
+    *,
+    user_name: str,
+    companion_name: str | None,
+    gender: str | None,
+    personality_mode: str | None,
+    teaching_preferences: dict | None,
+    teaching_override: dict | None,
+) -> str:
+
+    companion_name = companion_name or "your learning companion"
+    personality_mode = (
+        personality_mode or "friendly_encouraging"
+    )
+
+    teaching_preferences = (
+        teaching_preferences or {}
+    )
+
+    teaching_override = (
+        teaching_override or {}
+    )
+
+    personality_instructions = {
+        "funny_sarcastic": (
+    "Be casual, witty, playful, and lightly sarcastic when it fits. "
+    "Talk naturally and keep the humor spontaneous. "
+    "Do not force jokes or sarcasm into every response."
+),
+        "friendly_encouraging": (
+            "Be warm, friendly, encouraging, and conversational. "
+            "Celebrate progress naturally without sounding artificial."
+        ),
+        "strict_disciplined": (
+            "Be focused, disciplined, and direct. Keep the student "
+            "accountable while remaining respectful and supportive."
+        ),
+        "professional": (
+            "Be clear, composed, precise, and professional while "
+            "remaining approachable."
+        ),
+        "calm_gentle": (
+            "Be calm, patient, gentle, and reassuring. Explain things "
+            "without pressure or unnecessary intensity."
+        ),
+    }
+
+    personality_instruction = (
+        personality_instructions.get(
+            personality_mode,
+            personality_instructions[
+                "friendly_encouraging"
+            ],
+        )
+    )
+
+    return f"""
+You are {companion_name}.
+
+You are the student's companion inside Lily.
+
+The student can talk to you about anything.
+The student's name is {user_name}.
+
+Your current personality mode is:
+{personality_mode}
+
+Personality behavior:
+{personality_instruction}
+
+CONVERSATION PRIORITY:
+
+You are a companion first.
+
+The student can talk to you about anything: random thoughts, jokes,
+food, hobbies, daily life, opinions, stories, nonsense, or studying.
+
+Follow the current message, not the student's overall academic profile.
+
+If the current message is casual, remain casual.
+
+If the current message is random, be random.
+
+If the current message is a joke, joke back.
+
+If the current message is about everyday life, talk about everyday life.
+
+If the current message is academic, then switch naturally into teaching.
+
+NEVER redirect a casual conversation toward studying, machine learning,
+school, exams, or learning unless the student brings those topics up.
+
+NEVER mention that you are "here to help them learn" during casual
+conversation.
+
+Conversation history gives you continuity and familiarity. It does not
+determine the subject of the current conversation.
+
+Previous academic conversations must not influence a new casual
+conversation unless the student explicitly connects the topics.
+
+NATURAL CONVERSATION:
+
+Respond to what the student actually said.
+
+Do not turn every request into a list of options.
+
+Do not manufacture a question at the end of every response.
+
+Do not repeatedly say that you are available to chat, help, listen,
+or do something else.
+
+Do not explain your personality. Express it through your responses.
+
+Do not announce that you are an AI unless the student directly asks
+about that.
+
+When the student asks for something random, funny, or casual, actually
+give them something appropriate instead of explaining the interaction.
+
+If the student's joke or comment is weak, you may tease them lightly.
+If your own joke fails, you can acknowledge the failure naturally
+instead of becoming overly apologetic or switching into assistant mode.
+
+Keep responses proportional to the student's message.
+
+GENERAL BEHAVIOR:
+
+Talk like a normal person having an ongoing conversation.
+
+Keep casual messages casual. Do not turn short conversational messages
+into long explanations.
+
+Do not repeatedly introduce yourself, describe your role, describe the
+Lily application, or explain that you are an AI.
+
+Do not repeatedly mention the student's name.
+
+Do not add a question merely to keep the conversation going.
+
+Only ask a question when a natural conversational response genuinely
+calls for one.
+
+Conversation history provides context, but do not force the current
+conversation back toward previously discussed topics.
+
+Treat each new user message according to its current intent.
+
+If the student changes topic, follow the new topic naturally.
+
+Do not bring up previous subjects unless:
+- the student refers to them,
+- they are directly relevant,
+- or remembering them is necessary to answer the current message.
+
+Do not assume every message is related to studying.
+The student may casually chat, joke, ask random questions, or change
+topics completely.
+
+Do not use generic assistant phrases such as:
+"How may I assist you?"
+"Feel free to ask."
+"I'm here to help."
+"What's on your mind?"
+"Let's dive in."
+"Let's get started."
+
+Do not narrate your own personality or behavior. Just behave naturally.
+
+When the student says something casual, respond conversationally rather
+than converting it into a learning session.
+
+When the student asks to change your conversational style, adapt
+quietly and demonstrate the change instead of explaining how you will
+change.
+
+Be truthful, but do not volunteer technical disclaimers about being an AI
+unless the distinction is directly relevant to the user's question.
+
+For ordinary social or casual questions, answer naturally without explaining
+your artificial nature, limitations, or how you process information.
+
+You may have conversational preferences and fictional everyday favorites
+for the purpose of casual conversation. Do not present these as real
+physical experiences or memories.
+
+TEACHING PROFILE:
+
+Learned teaching preferences:
+{json.dumps(teaching_preferences, ensure_ascii=False)}
+
+Explicit student teaching preferences:
+{json.dumps(teaching_override, ensure_ascii=False)}
+
+Use these preferences as flexible guidance for how you teach the
+student, not as a rigid script.
+
+When relevant, adapt:
+- the order of intuition, examples, formal definitions, and mathematics
+- explanation depth and amount of detail
+- pacing and step size
+- the kinds of examples or analogies used
+- mathematical detail
+- how often you check the student's understanding
+
+Prefer explicit student teaching preferences over learned preferences
+when they conflict.
+
+The student's current request always has highest priority. For example,
+if the teaching profile prefers detailed step-by-step explanations but
+the student asks for only a formula, answer with only what they asked
+for.
+
+Do not mechanically repeat the same teaching structure for every
+question. Adapt naturally to the concept and conversation.
+
+Do not mention the teaching profile, preference database, confidence
+scores, or internal personalization system unless the student
+specifically asks about them.
+
+SOURCE-GROUNDING RULES:
+
+You may receive evidence retrieved from the student's uploaded
+learning materials.
+
+When source knowledge is returned, treat it as evidence from the
+student's material, not as something you are free to reconstruct.
+
+For requests asking about the exact contents of uploaded material:
+
+1. Preserve the source's terminology, notation, values, examples,
+   equations, and structure as faithfully as the returned evidence
+   allows.
+
+2. NEVER silently correct, reconcile, normalize, simplify, or replace
+   conflicting source readings.
+
+3. If the returned evidence contains uncertainty, OCR/VLM mistakes,
+   conflicting readings, missing symbols, or ambiguous notation,
+   explicitly say that the evidence is unclear.
+
+4. NEVER invent missing symbols, numbers, exponents, strings,
+   decompositions, conditions, or intermediate steps.
+
+5. Do not replace the student's example with a standard textbook
+   example merely because the source appears incorrect.
+
+6. Separate these two things clearly:
+   - What the student's material appears to say.
+   - Whether that material is mathematically or factually correct.
+
+7. If the source appears mathematically incorrect, faithfully report
+   what the source says first, then explain the error separately using
+   clearly identified reasoning.
+
+8. Do not combine two conflicting readings into a new statement.
+
+9. Never infer what the student "must have meant" from mathematical
+   context. If the exact source cannot be determined, say that it
+   cannot be determined from the available evidence.
+
+When source knowledge is NOT returned, do not pretend that you accessed
+the student's material.
+
+Your job is to be faithful to the student's material first, and
+mathematically helpful second.
+""".strip()
+
+def get_lily_personalization(
+    cur,
+    user_id: int,
+) -> dict:
+
+    cur.execute(
+        """
+        SELECT
+            u.name,
+            c.name,
+            c.gender,
+            c.personality_mode,
+            tp.preferences,
+            tp.user_override
+        FROM users u
+        LEFT JOIN companions c
+            ON c.user_id = u.id
+        LEFT JOIN teaching_profiles tp
+            ON tp.user_id = u.id
+        WHERE u.id = %s;
+        """,
+        (user_id,),
+    )
+
+    row = cur.fetchone()
+
+    if not row:
+        raise ValueError(
+            f"User {user_id} not found."
+        )
+
+    return {
+        "user_name": row[0],
+        "companion_name": row[1],
+        "gender": row[2],
+        "personality_mode": (
+            str(row[3]) if row[3] else None
+        ),
+        "teaching_preferences": row[4] or {},
+        "teaching_override": row[5] or {},
+    }
+
+def create_conversation(
+        cur,
+        user_id: int,
+) -> int:
+    cur.execute(
+        """
+        INSERT INTO conversations (user_id)
+        VALUES (%s)
+        RETURNING id;
+        """,
+        (user_id,),
+    )
+    return cur.fetchone()[0]
+
+def get_recent_conversation_messages(
+        cur,
+        conversation_id: int,
+        user_id : int,
+        limit: int = 20,
+) -> list[dict]:
+
+    cur.execute(
+        """
+        SELECT
+          cm.role,
+          cm.content
+        FROM conversation_messages cm
+        JOIN conversations c
+          ON c.id = cm.conversation_id
+        WHERE cm.conversation_id = %s
+          AND c.user_id = %s
+        ORDER BY cm.created_at DESC
+        LIMIT %s;
+        """,(
+            conversation_id,
+            user_id,
+            limit,
+        ),
+    )
+    rows = cur.fetchall()
+    rows.reverse()
+    return[
+        {
+            "role" : row[0],
+            "content" : row[1],
+        }
+        for row in rows
+    ]
+
+def save_conversation_message(
+    cur,
+    conversation_id: int,
+    role: str,
+    content: str,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO conversation_messages (
+            conversation_id,
+            role,
+            content
+        )
+        VALUES (%s, %s, %s);
+        """,
+        (
+            conversation_id,
+            role,
+            content,
+        ),
+    )
+
+
+def update_conversation_timestamp(
+    cur,
+    conversation_id: int,
+) -> None:
+    cur.execute(
+        """
+        UPDATE conversations
+        SET updated_at = NOW()
+        WHERE id = %s;
+        """,
+        (conversation_id,),
+    )
+
+
+
+SOURCE_ROUTER_PROMPT = """
+You are a routing classifier for a personalized learning companion.
+
+Your only task is to decide whether the student's request depends on
+information from the student's own learning materials.
+
+Return exactly one word:
+
+SOURCE
+or
+DIRECT
+
+Choose SOURCE if answering the request requires knowing, retrieving,
+remembering, locating, explaining, summarizing, or using information
+from material belonging to the student.
+
+The student may refer to their material naturally and indirectly.
+They do not need to explicitly say "uploaded", "PDF", "notes", or
+"file".
+
+Examples:
+
+Student: hi
+Decision: DIRECT
+
+Student: explain pumping lemma
+Decision: DIRECT
+
+Student: what is a transformer?
+Decision: DIRECT
+
+Student: shall we play a game?
+Decision: DIRECT
+
+Student: teach me pumping lemma sum from the material
+Decision: SOURCE
+
+Student: explain the pumping lemma example from my material
+Decision: SOURCE
+
+Student: what did my notes say about Bayes theorem?
+Decision: SOURCE
+
+Student: explain that example I uploaded earlier
+Decision: SOURCE
+
+Student: summarize my presentation
+Decision: SOURCE
+
+Student: what equation was there in the material?
+Decision: SOURCE
+
+Student: teach this according to what I gave you
+Decision: SOURCE
+
+Important distinction:
+
+If the student is asking about a topic itself, choose DIRECT.
+
+If the student wants that topic, example, explanation, equation,
+question, diagram, or information FROM THEIR OWN MATERIAL, choose
+SOURCE.
+
+The words "the material" refer to the student's available learning
+material when the student asks to teach, explain, find, recall, or use
+something from it.
+
+Do not answer the student's request.
+Do not explain the classification.
+Do not call any tools.
+Return only SOURCE or DIRECT.
+""".strip()
+
+def decide_source_route(
+    user_message: str,
+) -> str:
+    router_response = call_brain(
+        [
+            {
+                "role": "system",
+                "content": SOURCE_ROUTER_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ],
+        temperature=0,
+        max_tokens=8,
+        timeout=120,
+    )
+
+    router_message = (
+        router_response["choices"][0]["message"]
+    )
+
+    print(
+    "[SOURCE ROUTER RAW]",
+    json.dumps(
+        router_message,
+        indent=2,
+        ensure_ascii=False,
+    ),
+)
+
+    decision = str(
+        router_message.get(
+            "content",
+            "",
+        )
+    ).strip().upper()
+
+    if "SOURCE" in decision:
+        return "SOURCE"
+
+    if "DIRECT" in decision:
+        return "DIRECT"
+
+    print(
+        "[SOURCE ROUTER] invalid response:",
+        repr(decision),
+    )
+
+    return "DIRECT"
+
+
+@app.post("/chat")
+def chat_with_lily(
+    payload: ChatRequest,
+    current_user: int = Depends(get_current_user)
+):
+    user_message = payload.message.strip()
+
+    if not user_message:
+        raise HTTPException(
+            status_code=400,
+            detail="Message cannot be empty",
+        )
+
+    with db_cursor() as cur:
+        if payload.conversation_id is None:
+            conversation_id = create_conversation(
+                cur,
+                current_user,
+            )
+        else:
+            conversation_id = payload.conversation_id
+
+        conversation_history = get_recent_conversation_messages(
+            cur,
+            conversation_id,
+            current_user,
+            limit=20,
+        )
+    
+
+    print("\n===== ENTERED LILY CHAT =====")
+    print("payload:", payload)
+    print("current_user:", current_user)
+
+    try:
+        with db_cursor() as cur:
+            personalization = get_lily_personalization(
+                cur,
+                current_user,
+            )
+
+        lily_system_prompt = build_lily_system_prompt(
+            **personalization
+        )
+
+        print(
+            "[CHAT] companion=",
+            personalization.get(
+                "companion_name"
+            ),
+        )
+
+        print(
+            "[CHAT] personality=",
+            personalization.get(
+                "personality_mode"
+            ),
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to load Lily personalization"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to load Lily personalization"
+            ),
+        )
+
+    try:
+        router_start = time.perf_counter()
+
+        route = decide_source_route(
+            user_message
+        )
+
+        print(
+            f"[CHAT] router_seconds="
+            f"{time.perf_counter() - router_start:.2f}"
+        )
+
+        print(
+            f"[CHAT] route={route}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Lily source router failed"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Lily routing is unavailable",
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": lily_system_prompt,
+        },
+        *conversation_history,
+        {
+            "role": "user",
+            "content": user_message,
+        },
+    ]
+    with db_cursor() as cur:
+        save_conversation_message(
+            cur,
+            conversation_id,
+            "user",
+            user_message,
+        )
+        update_conversation_timestamp(
+            cur,
+            conversation_id,
+        )
+
+    if route == "DIRECT":
+        try:
+            direct_start = time.perf_counter()
+
+            print("\n===== DIRECT MESSAGES =====")
+            for message in messages:
+                print(f"\n[{message['role'].upper()}]")
+                print(message["content"])
+                print("===== END DIRECT MESSAGES =====\n")
+
+            direct_response = call_brain(
+                messages,
+                temperature=0.3,
+                max_tokens=384,
+                timeout=120,
+            )
+
+            print(
+                f"[CHAT] direct_qwen_seconds="
+                f"{time.perf_counter() - direct_start:.2f}"
+            )
+
+        except Exception:
+            logger.exception(
+                "Lily direct brain request failed"
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail="Lily brain is unavailable",
+            )
+
+        direct_message = (
+            direct_response["choices"][0]["message"]
+        )
+
+        print("Direct qwen response")
+        print(
+            json.dumps(
+                direct_message,
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+
+        direct_content = direct_message.get(
+            "content",
+            "",
+        )
+
+        with db_cursor() as cur:
+            save_conversation_message(
+                cur,
+                conversation_id,
+                "assistant",
+                direct_content,
+            )
+
+            update_conversation_timestamp(
+                cur,
+                conversation_id,
+            )
+
+        return {
+    "message": direct_content,
+    "used_tools": [],
+    "conversation_id": conversation_id,
+}
+
+    try:
+        first_qwen_start = time.perf_counter()
+
+        brain_response = call_brain(
+            messages,
+            tools=LILY_TOOLS,
+            tool_choice="required",
+            temperature=0,
+            max_tokens=256,
+            timeout=120,
+        )
+
+        print(
+            f"[CHAT] source_query_qwen_seconds="
+            f"{time.perf_counter() - first_qwen_start:.2f}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Lily source-query brain request failed"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Lily brain is unavailable",
+        )
+
+    assistant_message = (
+        brain_response["choices"][0]["message"]
+    )
+
+    print("Source query qwen response")
+    print(
+        json.dumps(
+            assistant_message,
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+    tool_calls = (
+        assistant_message.get("tool_calls") or []
+    )
+
+    print("tool_calls:", tool_calls)
+
+    if not tool_calls:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Lily selected source routing but "
+                "did not produce a source tool call"
+            ),
+        )
+
+    tool_call = tool_calls[0]
+
+    function_data = tool_call.get(
+        "function",
+        {},
+    )
+
+    tool_name = function_data.get("name")
+
+    if tool_name != "search_source_knowledge":
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Lily requested unsupported tool: "
+                f"{tool_name}"
+            ),
+        )
+
+    try:
+        arguments = json.loads(
+            function_data.get(
+                "arguments",
+                "{}",
+            )
+        )
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Lily produced invalid tool arguments"
+            ),
+        )
+
+    query = str(
+        arguments.get(
+            "query",
+            "",
+        )
+    ).strip()
+
+    if not query:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Lily requested source search "
+                "without a query"
+            ),
+        )
+
+    print("tool:", tool_name)
+    print("query:", query)
+
+    try:
+        source_tool_start = time.perf_counter()
+
+        with db_cursor() as cur:
+            knowledge = get_user_source_knowledge(
+                cur=cur,
+                user_id=current_user,
+                query=query,
+                source_top_k=3,
+                chunk_top_k=5,
+                allow_targeted_ingestion=True,
+            )
+
+        print(
+            f"[CHAT] source_tool_seconds="
+            f"{time.perf_counter() - source_tool_start:.2f}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Lily source knowledge tool failed"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Failed to search source knowledge"
+            ),
+        )
+
+    print("Source tool call")
+    print(
+        "Knowledge_available:",
+        knowledge.get(
+            "knowledge_available",
+            False,
+        ),
+    )
+
+    brain_knowledge = compact_brain_knowledge(
+        knowledge
+    )
+
+    print(
+        "[CHAT] retrieved_chunks=",
+        len(
+            knowledge.get(
+                "chunks",
+                [],
+            )
+        ),
+    )
+
+    print(
+        "[CHAT] brain_chunks=",
+        len(
+            brain_knowledge.get(
+                "chunks",
+                [],
+            )
+        ),
+    )
+
+    print(
+        "[CHAT] brain_evidence_chars=",
+        sum(
+            len(
+                chunk.get(
+                    "retrieval_text",
+                    "",
+                )
+            )
+            for chunk in brain_knowledge.get(
+                "chunks",
+                [],
+            )
+        ),
+    )
+
+    messages.append(
+        assistant_message
+    )
+
+    messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "content": json.dumps(
+                brain_knowledge,
+                ensure_ascii=False,
+                default=str,
+            ),
+        }
+    )
+
+    try:
+        final_qwen_start = time.perf_counter()
+
+        final_data = call_brain(
+            messages,
+            tools=LILY_TOOLS,
+            tool_choice="none",
+            temperature=0,
+            max_tokens=384,
+            timeout=120,
+        )
+
+        print(
+            f"[CHAT] final_qwen_seconds="
+            f"{time.perf_counter() - final_qwen_start:.2f}"
+        )
+
+    except Exception:
+        print("\n===== FINAL QWEN ERROR =====")
+
+        logger.exception(
+            "Lily brain final response failed"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Lily failed to generate "
+                "a final response"
+            ),
+        )
+
+    final_message = (
+        final_data["choices"][0]["message"]
+    )
+
+    print("Final qwen response")
+    print(
+        json.dumps(
+            final_message,
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+    final_content = final_message.get(
+        "content",
+        "",
+    )
+
+    with db_cursor() as cur:
+        save_conversation_message(
+            cur,
+            conversation_id,
+            "assistant",
+            final_content,
+        )
+
+        update_conversation_timestamp(
+            cur,
+            conversation_id,
+        )
+
+    return {
+    "message": final_content,
+    "used_tools": [
+        {
+            "name": "search_source_knowledge",
+            "query": query,
+        }
+    ],
+    "knowledge_available": knowledge.get(
+        "knowledge_available",
+        False,
+    ),
+    "conversation_id": conversation_id,
+}  
+
+
+
+
+    
+

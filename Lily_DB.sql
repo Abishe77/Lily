@@ -200,5 +200,5 @@ CREATE TABLE teaching_profiles (
 CREATE INDEX idx_teaching_profiles_user_id
     ON teaching_profiles(user_id);
 
-
-
+select * from sources 
+where id =20;
